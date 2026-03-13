@@ -515,26 +515,12 @@ ls /etc/supervisor/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1 && \
 ls /etc/nginx/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1 && \
     EXISTING_ITEMS+=("Nginx-Config für ${BENCH_DIR}")
 
-# MariaDB: Nicht-System-DBs ermitteln (immer prüfen, auch ohne laufende Instanz)
-MARIADB_EXTRA_DBS=()
+# MariaDB-DBs werden nach Schritt 4 bereinigt (erst dann ist Root-Passwort sicher gesetzt)
 DB_CLIENT=""
 if command -v mariadb &>/dev/null; then
     DB_CLIENT="mariadb"
 elif command -v mysql &>/dev/null; then
     DB_CLIENT="mysql"
-fi
-
-if [[ -n "$DB_CLIENT" ]]; then
-    # Verbindung ohne Passwort versuchen (fresh install oder socket-auth)
-    while IFS= read -r db; do
-        [[ -z "$db" || "$db" == "Database" ]] && continue
-        MARIADB_EXTRA_DBS+=("$db")
-    done < <("$DB_CLIENT" -u root --connect-timeout=5 -e "SHOW DATABASES;" 2>/dev/null \
-        | grep -v -E "^(Database|mysql|information_schema|performance_schema|sys)$" || true)
-
-    if [[ ${#MARIADB_EXTRA_DBS[@]} -gt 0 ]]; then
-        EXISTING_ITEMS+=("MariaDB-Datenbanken (${#MARIADB_EXTRA_DBS[@]}): ${MARIADB_EXTRA_DBS[*]}")
-    fi
 fi
 
 if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
@@ -604,27 +590,6 @@ if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
     rm -rf /root/.local/share/uv 2>/dev/null
     rm -rf /root/.cache/uv       2>/dev/null
     rm -f  /root/uv.toml         2>/dev/null
-
-    # 7. MariaDB: Alle Nicht-System-Datenbanken + zugehörige User löschen
-    if [[ ${#MARIADB_EXTRA_DBS[@]} -gt 0 && -n "$DB_CLIENT" ]]; then
-        log_info "Lösche MariaDB-Datenbanken: ${MARIADB_EXTRA_DBS[*]}"
-        for db in "${MARIADB_EXTRA_DBS[@]}"; do
-            if "$DB_CLIENT" -u root --connect-timeout=5 \
-                    -e "DROP DATABASE IF EXISTS \`${db}\`;" >> "$LOGFILE" 2>&1; then
-                log_ok "DB gelöscht: ${db}"
-            else
-                log_warn "DB löschen fehlgeschlagen: ${db}"
-            fi
-            # Frappe-Konvention: DB-User hat denselben Namen wie die DB
-            "$DB_CLIENT" -u root --connect-timeout=5 \
-                -e "DROP USER IF EXISTS '${db}'@'localhost';" >> "$LOGFILE" 2>&1 || true
-            "$DB_CLIENT" -u root --connect-timeout=5 \
-                -e "DROP USER IF EXISTS '${db}'@'%';"         >> "$LOGFILE" 2>&1 || true
-        done
-        "$DB_CLIENT" -u root --connect-timeout=5 \
-            -e "FLUSH PRIVILEGES;" >> "$LOGFILE" 2>&1 || true
-        log_ok "MariaDB-Cleanup abgeschlossen."
-    fi
 
     log_ok "Aufräumen abgeschlossen."
     echo ""
@@ -756,6 +721,28 @@ elif mariadb -u root -p"${MYSQL_ROOT_PASS}" -e "SELECT 1;" >> "$LOGFILE" 2>&1; t
 else
     stop_spinner
     log_warn "MariaDB Root hat ein anderes Passwort — bitte prüfen!"
+fi
+
+# --- MariaDB: Alle Nicht-System-DBs löschen (jetzt mit gesetztem Root-Passwort) ---
+# Wird hier ausgeführt damit bench new-site keine Konflikte mit alten Instanzen hat.
+DB_CLIENT_CMD="mariadb -u root -p${MYSQL_ROOT_PASS} --connect-timeout=5"
+MARIADB_EXTRA_DBS=()
+while IFS= read -r db; do
+    [[ -z "$db" || "$db" == "Database" ]] && continue
+    MARIADB_EXTRA_DBS+=("$db")
+done < <($DB_CLIENT_CMD -e "SHOW DATABASES;" 2>/dev/null \
+    | grep -v -E "^(Database|mysql|information_schema|performance_schema|sys)$" || true)
+
+if [[ ${#MARIADB_EXTRA_DBS[@]} -gt 0 ]]; then
+    log_info "Lösche alte MariaDB-Datenbanken: ${MARIADB_EXTRA_DBS[*]}"
+    for db in "${MARIADB_EXTRA_DBS[@]}"; do
+        $DB_CLIENT_CMD -e "DROP DATABASE IF EXISTS \`${db}\`;" >> "$LOGFILE" 2>&1 && \
+            log_ok "DB gelöscht: ${db}" || log_warn "DB löschen fehlgeschlagen: ${db}"
+        $DB_CLIENT_CMD -e "DROP USER IF EXISTS '${db}'@'localhost';" >> "$LOGFILE" 2>&1 || true
+        $DB_CLIENT_CMD -e "DROP USER IF EXISTS '${db}'@'%';"         >> "$LOGFILE" 2>&1 || true
+    done
+    $DB_CLIENT_CMD -e "FLUSH PRIVILEGES;" >> "$LOGFILE" 2>&1 || true
+    log_ok "MariaDB-Cleanup abgeschlossen (${#MARIADB_EXTRA_DBS[@]} DBs entfernt)."
 fi
 
 # ─── 5. Redis ─────────────────────────────────────────────────────────────────
