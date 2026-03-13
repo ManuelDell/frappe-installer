@@ -328,7 +328,7 @@ echo ""
 # ─── Frappe-Version ────────────────────────────────────────────────────────────
 
 echo -e "${BOLD}Frappe-Version:${NC}"
-echo "  1) version-15  (stable — Python 3.11, Node 18, MariaDB 10.x)"
+echo "  1) version-15  (stable — Python 3.10+, Node 20, MariaDB 10.x)"
 echo "  2) version-16  (develop — Python 3.14, Node 24, MariaDB 11.8)"
 echo ""
 while true; do
@@ -420,17 +420,23 @@ CONFIRM="${CONFIRM:-j}"
 echo ""
 
 # ─── Versions-Variablen ───────────────────────────────────────────────────────
+# Quelle: https://docs.frappe.io/framework/user/en/installation
+#
+# v14/v15: Python 3.10+, Node 18+, MariaDB 10.6.6+
+# v16:     Python 3.14,  Node 24,  MariaDB 11.8
 
 if [[ "$FRAPPE_BRANCH" == "version-15" ]]; then
-    TARGET_PYTHON="3.11"
-    NODE_VERSION="18"
-    USE_UV=false
-    MARIADB_FROM_REPO=false
+    PYTHON_MIN="3.10"           # Minimum laut Doku
+    PYTHON_EXACT=""             # Kein exaktes Match nötig, >=3.10 reicht
+    NODE_VERSION="20"           # 18 ist EOL, 20 LTS ist sicher
+    USE_UV=false                # System-Python reicht
+    MARIADB_FROM_REPO=false     # System-MariaDB (10.x) reicht
 else
-    TARGET_PYTHON="3.14"
+    PYTHON_MIN="3.14"           # Exakt 3.14.x erforderlich
+    PYTHON_EXACT="3.14"         # bench init/pip erzwingt >=3.14,<3.15
     NODE_VERSION="24"
-    USE_UV=true
-    MARIADB_FROM_REPO=true
+    USE_UV=true                 # uv nötig für Python 3.14
+    MARIADB_FROM_REPO=true      # MariaDB 11.8 aus offiziellem Repo
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -717,20 +723,34 @@ if command -v node &>/dev/null; then
     EXISTING_MAJOR=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
     if [[ "$EXISTING_MAJOR" -eq "$NODE_VERSION" ]] 2>/dev/null; then
         NEED_NODE=false
-    elif [[ "$EXISTING_MAJOR" -ne "$NODE_VERSION" ]] 2>/dev/null; then
-        # Falsche Node-Version → deinstallieren
+    else
+        # Falsche Node-Version → gründlich entfernen
         log_info "Node.js v${EXISTING_MAJOR} gefunden, benötigt v${NODE_VERSION} — ersetze..."
         apt-get remove -y -qq nodejs >> "$LOGFILE" 2>&1 || true
-        rm -f /etc/apt/sources.list.d/nodesource.list 2>/dev/null
+        apt-get autoremove -y -qq >> "$LOGFILE" 2>&1 || true
+        # Alle NodeSource-Repos entfernen
+        rm -f /etc/apt/sources.list.d/nodesource* 2>/dev/null
+        rm -f /etc/apt/keyrings/nodesource* 2>/dev/null
+        rm -f /usr/share/keyrings/nodesource* 2>/dev/null
         apt-get update -qq >> "$LOGFILE" 2>&1 || true
     fi
 fi
 
 if [[ "$NEED_NODE" == true ]]; then
+    # Altes NodeSource-Repo immer entfernen bevor neues eingerichtet wird
+    rm -f /etc/apt/sources.list.d/nodesource* 2>/dev/null
+    rm -f /etc/apt/keyrings/nodesource* 2>/dev/null
+
     log_to_file "Node.js ${NODE_VERSION} via NodeSource..."
     curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" 2>/dev/null \
         | bash - >> "$LOGFILE" 2>&1
     run_cmd_or_die "Node.js" apt-get install -y -qq nodejs
+
+    # Verifiziere dass die richtige Version installiert wurde
+    INSTALLED_NODE=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
+    if [[ "$INSTALLED_NODE" -ne "$NODE_VERSION" ]] 2>/dev/null; then
+        log_warn "Node.js v${INSTALLED_NODE} installiert statt v${NODE_VERSION}!"
+    fi
 fi
 
 if ! command -v yarn &>/dev/null; then
@@ -740,16 +760,13 @@ fi
 stop_spinner
 log_ok "Node.js $(node --version 2>/dev/null), Yarn $(yarn --version 2>/dev/null)"
 
-# ─── 7. System-Python sicherstellen ───────────────────────────────────────────
+# ─── 7. System-Python prüfen ─────────────────────────────────────────────────
 
 step_start 7 "System-Python prüfen"
 
-# Schritt 7 stellt nur sicher, dass ein System-Python als FALLBACK existiert.
-# Das eigentliche Python für Frappe wird in Schritt 9 als $BENCH_USER installiert,
-# weil bench/uv alles lokal im User-Home erwartet.
-
+# Finde das beste System-Python
 SYSTEM_PYTHON=""
-for py in "python${TARGET_PYTHON}" python3.13 python3.12 python3.11 python3; do
+for py in python3.14 python3.13 python3.12 python3.11 python3; do
     if command -v "$py" &>/dev/null; then
         SYSTEM_PYTHON=$(command -v "$py")
         break
@@ -757,7 +774,7 @@ for py in "python${TARGET_PYTHON}" python3.13 python3.12 python3.11 python3; do
 done
 
 if [[ -n "$SYSTEM_PYTHON" ]]; then
-    log_to_file "System-Python gefunden: $($SYSTEM_PYTHON --version 2>&1) → ${SYSTEM_PYTHON}"
+    log_to_file "System-Python: $($SYSTEM_PYTHON --version 2>&1) → ${SYSTEM_PYTHON}"
 fi
 
 stop_spinner
@@ -858,48 +875,90 @@ if [[ "$USE_UV" == true ]]; then
     fi
 fi
 
-# --- Python als User installieren (v16 via uv) ---
+# --- Python als User vorbereiten ---
 USER_PYTHON_BIN=""
 
-if [[ "$USE_UV" == true ]]; then
-    log_info "Installiere Python ${TARGET_PYTHON} als ${BENCH_USER} via uv..."
+# Hilfsfunktion: Prüft ob Python-Version >= Minimum ist
+# Nutzung: python_version_ge "3.13" "3.10" → true
+python_version_ge() {
+    local have="$1" need="$2"
+    local have_major="${have%%.*}" have_minor="${have#*.}"
+    local need_major="${need%%.*}" need_minor="${need#*.}"
+    have_minor="${have_minor%%.*}"; need_minor="${need_minor%%.*}"
+    if [[ "$have_major" -gt "$need_major" ]] 2>/dev/null; then return 0; fi
+    if [[ "$have_major" -eq "$need_major" && "$have_minor" -ge "$need_minor" ]] 2>/dev/null; then return 0; fi
+    return 1
+}
 
-    if [[ "$OUTPUT_MODE" == "verbose" ]]; then
-        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${TARGET_PYTHON}" 2>&1 | tee -a "$LOGFILE" >&3 || true
-    else
-        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${TARGET_PYTHON}" >> "$LOGFILE" 2>&1 || true
+if [[ -n "$PYTHON_EXACT" ]]; then
+    # v16: Braucht exakt Python 3.14.x — muss via uv installiert werden
+    log_info "Installiere Python ${PYTHON_EXACT} als ${BENCH_USER} via uv..."
+
+    if [[ "$USE_UV" == true ]]; then
+        if [[ "$OUTPUT_MODE" == "verbose" ]]; then
+            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" 2>&1 | tee -a "$LOGFILE" >&3 || true
+        else
+            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" >> "$LOGFILE" 2>&1 || true
+        fi
+
+        USER_PYTHON_BIN=$(run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${PYTHON_EXACT}" 2>/dev/null || echo "")
+
+        if [[ -n "$USER_PYTHON_BIN" ]]; then
+            log_ok "Python ${PYTHON_EXACT} installiert: ${USER_PYTHON_BIN}"
+        else
+            log_warn "uv python install ${PYTHON_EXACT} fehlgeschlagen!"
+            log_to_file "DEBUG: uv python list:"
+            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python list --only-installed" >> "$LOGFILE" 2>&1 || true
+        fi
     fi
 
-    # Prüfe ob es geklappt hat
-    USER_PYTHON_BIN=$(run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${TARGET_PYTHON}" 2>/dev/null || echo "")
-
-    if [[ -n "$USER_PYTHON_BIN" ]]; then
-        log_ok "Python ${TARGET_PYTHON} installiert: ${USER_PYTHON_BIN}"
-    else
-        log_warn "uv python install ${TARGET_PYTHON} fehlgeschlagen!"
-        # Zeige was uv tatsächlich installiert hat
-        log_to_file "DEBUG: uv python list:"
-        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python list --only-installed" >> "$LOGFILE" 2>&1 || true
+    # System-Python nur wenn es exakt 3.14.x ist
+    if [[ -z "$USER_PYTHON_BIN" && -n "${SYSTEM_PYTHON:-}" ]]; then
+        SYS_PY_VER=$("$SYSTEM_PYTHON" --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
+        if [[ "$SYS_PY_VER" == "$PYTHON_EXACT" ]]; then
+            USER_PYTHON_BIN="$SYSTEM_PYTHON"
+            log_ok "System-Python ${SYS_PY_VER} passt exakt."
+        else
+            log_warn "System-Python ist ${SYS_PY_VER}, aber exakt ${PYTHON_EXACT} wird benötigt!"
+        fi
     fi
-fi
 
-# Fallback: System-Python — aber NUR wenn die Version passt!
-if [[ -z "$USER_PYTHON_BIN" && -n "${SYSTEM_PYTHON:-}" ]]; then
-    SYS_PY_VERSION=$("$SYSTEM_PYTHON" --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
-    if [[ "$SYS_PY_VERSION" == "$TARGET_PYTHON" ]]; then
-        USER_PYTHON_BIN="$SYSTEM_PYTHON"
-        log_ok "System-Python ${SYS_PY_VERSION} passt."
-    else
-        log_warn "System-Python ist ${SYS_PY_VERSION}, aber ${TARGET_PYTHON} wird benötigt!"
-    fi
-fi
-
-if [[ -z "$USER_PYTHON_BIN" ]]; then
-    die "Python ${TARGET_PYTHON} konnte nicht installiert werden!
-    Frappe ${FRAPPE_BRANCH} erfordert zwingend Python ${TARGET_PYTHON}.
-    Prüfe ob 'uv python install ${TARGET_PYTHON}' als User funktioniert.
+    [[ -z "$USER_PYTHON_BIN" ]] && die "Python ${PYTHON_EXACT} konnte nicht installiert werden!
+    Frappe ${FRAPPE_BRANCH} erfordert zwingend Python ${PYTHON_EXACT}.
+    Prüfe ob 'uv python install ${PYTHON_EXACT}' als User funktioniert.
     Log: ${LOGFILE}"
+
+else
+    # v15: System-Python >= PYTHON_MIN reicht (3.10+)
+    if [[ -n "${SYSTEM_PYTHON:-}" ]]; then
+        SYS_PY_VER=$("$SYSTEM_PYTHON" --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
+        if python_version_ge "$SYS_PY_VER" "$PYTHON_MIN"; then
+            USER_PYTHON_BIN="$SYSTEM_PYTHON"
+            log_ok "System-Python ${SYS_PY_VER} >= ${PYTHON_MIN} — passt."
+        else
+            log_warn "System-Python ${SYS_PY_VER} < ${PYTHON_MIN}!"
+        fi
+    fi
+
+    # Falls System-Python nicht reicht → via uv als User installieren
+    if [[ -z "$USER_PYTHON_BIN" ]]; then
+        log_info "Installiere Python ${PYTHON_MIN} als ${BENCH_USER} via uv..."
+        # uv für den User installieren falls noch nicht geschehen
+        if ! run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv --version" >> "$LOGFILE" 2>&1; then
+            run_as_user "curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh" >> "$LOGFILE" 2>&1 || true
+        fi
+        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_MIN}" >> "$LOGFILE" 2>&1 || true
+        USER_PYTHON_BIN=$(run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${PYTHON_MIN}" 2>/dev/null || echo "")
+
+        if [[ -n "$USER_PYTHON_BIN" ]]; then
+            log_ok "Python ${PYTHON_MIN} via uv installiert: ${USER_PYTHON_BIN}"
+        fi
+    fi
+
+    [[ -z "$USER_PYTHON_BIN" ]] && die "Kein Python >= ${PYTHON_MIN} verfügbar!"
 fi
+
+log_to_file "Python für bench: ${USER_PYTHON_BIN}"
 
 # --- frappe-bench CLI als User ---
 BENCH_CLI_OK=false
@@ -1064,6 +1123,27 @@ echo -e "\n${BOLD}Supervisor-Status:${NC}" >&3
 supervisorctl status 2>/dev/null | sed 's/^/    /' >&3 || \
     echo "    (noch nicht bereit — kurz warten)" >&3
 
+# ─── IP und Port ermitteln ─────────────────────────────────────────────────────
+
+# IP-Adresse der Instanz ermitteln (erste nicht-localhost IPv4)
+INSTANCE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+[[ -z "$INSTANCE_IP" ]] && INSTANCE_IP=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
+[[ -z "$INSTANCE_IP" ]] && INSTANCE_IP="<IP>"
+
+# Nginx-Port (Standard: 80)
+NGINX_PORT="80"
+if [[ -f "${BENCH_PATH}/config/nginx.conf" ]]; then
+    DETECTED_PORT=$(grep -oP 'listen\s+\K\d+' "${BENCH_PATH}/config/nginx.conf" 2>/dev/null | head -1)
+    [[ -n "$DETECTED_PORT" ]] && NGINX_PORT="$DETECTED_PORT"
+fi
+
+# URL zusammenbauen
+if [[ "$NGINX_PORT" == "80" ]]; then
+    SITE_URL="http://${INSTANCE_IP}"
+else
+    SITE_URL="http://${INSTANCE_IP}:${NGINX_PORT}"
+fi
+
 # ─── Ergebnis ──────────────────────────────────────────────────────────────────
 
 echo -e "
@@ -1075,17 +1155,24 @@ ${GREEN}╔═══════════════════════
     Frappe:     ${FRAPPE_VERSION} (${FRAPPE_BRANCH})
     MariaDB:    $(mariadb --version 2>/dev/null | grep -oP 'Ver \K[^ ]+' || echo '?')
     Node.js:    $(node --version 2>/dev/null || echo '?')
-    Python:     $($PYTHON_BIN --version 2>&1)
+    Python:     $(${USER_PYTHON_BIN} --version 2>&1 || echo '?')
     Bench CLI:  v${BENCH_VERSION}
 
   ${BOLD}Pfade${NC}
     Bench:      ${BENCH_PATH}
     Logfile:    ${LOGFILE}" >&3
 
-[[ -n "$SITE_NAME" ]] && echo -e "
+if [[ -n "$SITE_NAME" ]]; then
+    echo -e "
   ${BOLD}Site${NC}
     Name:       ${SITE_NAME}
-    URL:        http://${SITE_NAME}" >&3
+    ${GREEN}${BOLD}Website:    ${SITE_URL}${NC}" >&3
+else
+    echo -e "
+  ${BOLD}Website${NC}
+    ${DIM}Erreichbar unter ${SITE_URL} sobald eine Site erstellt wird:${NC}
+    ${CYAN}cd ${BENCH_PATH} && bench new-site <name> --admin-password <pw> --mariadb-root-password <pw>${NC}" >&3
+fi
 
 echo -e "
   ${BOLD}Befehle${NC}
