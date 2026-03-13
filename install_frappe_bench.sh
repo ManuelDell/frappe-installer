@@ -1090,9 +1090,13 @@ USER_PYTHON_BIN=""
 if [[ -n "$PYTHON_EXACT" ]]; then
     log_info "${T_PY_INSTALL}${PYTHON_EXACT}${T_PY_INSTALL2}${BENCH_USER}${T_PY_INSTALL3}"
     if [[ "$USE_UV" == true ]]; then
-        [[ "$OUTPUT_MODE" == "verbose" ]] && \
-            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" 2>&1 | tee -a "$LOGFILE" >&3 || true || \
-            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" >> "$LOGFILE" 2>&1 || true
+        if [[ "$OUTPUT_MODE" == "verbose" ]]; then
+            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" \
+                2>&1 | tee -a "$LOGFILE" >&3 || true
+        else
+            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" \
+                >> "$LOGFILE" 2>&1 || true
+        fi
         USER_PYTHON_BIN=$(run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${PYTHON_EXACT}" 2>/dev/null || echo "")
         [[ -n "$USER_PYTHON_BIN" ]] && log_ok "${T_PY_OK}${PYTHON_EXACT}${T_PY_OK2}${USER_PYTHON_BIN}" || \
             { log_warn "${T_PY_FAIL}${PYTHON_EXACT}${T_PY_FAIL2}"
