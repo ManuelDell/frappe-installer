@@ -429,13 +429,13 @@ if [[ "$FRAPPE_BRANCH" == "version-15" ]]; then
     PYTHON_MIN="3.10"           # Minimum laut Doku
     PYTHON_EXACT=""             # Kein exaktes Match nötig, >=3.10 reicht
     NODE_VERSION="20"           # 18 ist EOL, 20 LTS ist sicher
-    USE_UV=false                # System-Python reicht
+    USE_UV=true                 # uv für bench CLI Installation (immer)
     MARIADB_FROM_REPO=false     # System-MariaDB (10.x) reicht
 else
     PYTHON_MIN="3.14"           # Exakt 3.14.x erforderlich
     PYTHON_EXACT="3.14"         # bench init/pip erzwingt >=3.14,<3.15
     NODE_VERSION="24"
-    USE_UV=true                 # uv nötig für Python 3.14
+    USE_UV=true                 # uv für Python 3.14 + bench CLI
     MARIADB_FROM_REPO=true      # MariaDB 11.8 aus offiziellem Repo
 fi
 
@@ -460,11 +460,16 @@ EXISTING_ITEMS=()
 BENCH_FULL="${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}"
 [[ -d "$BENCH_FULL" ]] && EXISTING_ITEMS+=("Bench-Verzeichnis: ${BENCH_FULL}")
 
-# User mit altem bench/uv
+# User mit altem bench/uv/pip-Resten
 if id "$BENCH_USER" &>/dev/null; then
     UH="/home/${BENCH_USER}"
-    [[ -d "${UH}/.local/share/uv" ]] && EXISTING_ITEMS+=("uv-Daten: ${UH}/.local/share/uv/")
-    [[ -f "${UH}/.local/bin/bench" ]] && EXISTING_ITEMS+=("bench CLI: ${UH}/.local/bin/bench")
+    [[ -d "${UH}/.local/share/uv" ]]    && EXISTING_ITEMS+=("uv-Daten: ${UH}/.local/share/uv/")
+    [[ -f "${UH}/.local/bin/bench" ]]    && EXISTING_ITEMS+=("bench CLI: ${UH}/.local/bin/bench")
+    [[ -f "${UH}/.local/bin/uv" ]]       && EXISTING_ITEMS+=("uv Binary: ${UH}/.local/bin/uv")
+    # pip-installierte bench-Reste
+    if find "${UH}/.local/lib" -path "*/site-packages/bench" -type d 2>/dev/null | grep -q .; then
+        EXISTING_ITEMS+=("pip bench-Pakete: ${UH}/.local/lib/")
+    fi
 fi
 
 # Falsche Node.js-Version
@@ -496,41 +501,64 @@ if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
 
     log_info "Räume auf..."
 
-    # Supervisor stoppen
+    # 1. Supervisor stoppen
     if command -v supervisorctl &>/dev/null; then
         supervisorctl stop all >> "$LOGFILE" 2>&1 || true
     fi
 
-    # Bench-Verzeichnis löschen
+    # 2. Bench-Verzeichnis löschen
     if [[ -d "$BENCH_FULL" ]]; then
         rm -rf "$BENCH_FULL"
         log_ok "Gelöscht: ${BENCH_FULL}"
     fi
 
-    # Supervisor/Nginx-Configs entfernen
+    # 3. Supervisor/Nginx-Configs entfernen
     rm -f /etc/supervisor/conf.d/*"${BENCH_DIR}"* 2>/dev/null
     rm -f /etc/nginx/conf.d/*"${BENCH_DIR}"* 2>/dev/null
     supervisorctl reread >> "$LOGFILE" 2>&1 || true
     supervisorctl update >> "$LOGFILE" 2>&1 || true
 
-    # uv/bench im User-Home
+    # 4. KOMPLETTES User-lokales Environment bereinigen
+    #    bench/uv/pip legen alles unter ~/.local/ ab — sauber entfernen
     if id "$BENCH_USER" &>/dev/null; then
         UH="/home/${BENCH_USER}"
+
+        # uv komplett
         rm -rf "${UH}/.local/share/uv" 2>/dev/null
+        rm -rf "${UH}/.cache/uv" 2>/dev/null
+
+        # bench CLI (egal ob via uv oder pip installiert)
         rm -f "${UH}/.local/bin/bench" 2>/dev/null
-        log_ok "User-Caches bereinigt."
+
+        # pip-installierte bench und Abhängigkeiten
+        # (löscht site-packages/bench*, site-packages/frappe_bench*)
+        find "${UH}/.local/lib" -maxdepth 4 -type d \
+            \( -name "bench" -o -name "bench-*" -o -name "frappe_bench*" \) \
+            -exec rm -rf {} + 2>/dev/null || true
+
+        # uv-Binary (wird in Schritt 9 neu installiert)
+        rm -f "${UH}/.local/bin/uv" "${UH}/.local/bin/uvx" 2>/dev/null
+        rm -f "${UH}/.cargo/bin/uv" "${UH}/.cargo/bin/uvx" 2>/dev/null
+
+        log_ok "User-Environment bereinigt: ${UH}/.local/"
     fi
 
-    # Falsche Node.js entfernen
+    # 5. Falsche Node.js entfernen
     if command -v node &>/dev/null; then
         OLD_NODE=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
         if [[ "$OLD_NODE" -ne "$NODE_VERSION" ]] 2>/dev/null; then
             apt-get remove -y -qq nodejs >> "$LOGFILE" 2>&1 || true
             apt-get autoremove -y -qq >> "$LOGFILE" 2>&1 || true
-            rm -f /etc/apt/sources.list.d/nodesource.list 2>/dev/null
+            rm -f /etc/apt/sources.list.d/nodesource* 2>/dev/null
+            rm -f /etc/apt/keyrings/nodesource* 2>/dev/null
             log_ok "Node.js v${OLD_NODE} entfernt."
         fi
     fi
+
+    # 6. Auch root-uv-Reste entfernen (von früheren Skript-Versionen)
+    rm -rf /root/.local/share/uv 2>/dev/null
+    rm -rf /root/.cache/uv 2>/dev/null
+    rm -f /root/uv.toml 2>/dev/null
 
     log_ok "Aufräumen abgeschlossen."
     echo ""
@@ -788,22 +816,38 @@ if command -v wkhtmltopdf &>/dev/null; then
     stop_spinner
     log_ok "wkhtmltopdf bereits vorhanden."
 else
+    # Abhängigkeiten vorab installieren (fehlen auf Debian 13)
+    for dep in xfonts-75dpi xfonts-base libxrender1 libxext6; do
+        apt-get install -y -qq "$dep" >> "$LOGFILE" 2>&1 || true
+    done
+
     ARCH=$(dpkg --print-architecture)
     WKHTML_DEB="/tmp/wkhtmltox.deb"
     WKHTML_OK=false
 
+    # URLs in Reihenfolge: neueste zuerst, Fallbacks danach
     WKHTML_URLS=(
         "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.${OS_ID}${OS_VERSION}_${ARCH}.deb"
+        "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.bookworm_${ARCH}.deb"
+        "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.jammy_${ARCH}.deb"
         "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6-1/wkhtmltox_0.12.6-1.buster_${ARCH}.deb"
     )
 
     for url in "${WKHTML_URLS[@]}"; do
         log_to_file "Versuche: ${url}"
         if wget -q -O "$WKHTML_DEB" "$url" 2>/dev/null; then
-            if dpkg -i "$WKHTML_DEB" >> "$LOGFILE" 2>&1; then
-                WKHTML_OK=true; break
+            # dpkg installieren, fehlende Deps automatisch nachziehen
+            dpkg -i "$WKHTML_DEB" >> "$LOGFILE" 2>&1 || true
+            apt-get install -f -y -qq >> "$LOGFILE" 2>&1 || true
+
+            # Prüfe ob es WIRKLICH installiert ist
+            if command -v wkhtmltopdf &>/dev/null; then
+                WKHTML_OK=true
+                break
+            else
+                # Installation fehlgeschlagen — Paket entfernen und nächste URL
+                dpkg --remove wkhtmltox >> "$LOGFILE" 2>&1 || true
             fi
-            apt-get install -f -y -qq >> "$LOGFILE" 2>&1 && WKHTML_OK=true && break
         fi
     done
     rm -f "$WKHTML_DEB"
@@ -812,7 +856,8 @@ else
     if [[ "$WKHTML_OK" == true ]]; then
         log_ok "wkhtmltopdf installiert."
     else
-        log_warn "wkhtmltopdf nicht installierbar — manuell nachholen."
+        log_warn "wkhtmltopdf nicht installierbar — PDF-Generierung eingeschränkt."
+        log_warn "→ Manuell: https://wkhtmltopdf.org/downloads.html"
     fi
 fi
 
