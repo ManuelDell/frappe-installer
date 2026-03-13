@@ -7,7 +7,7 @@ Das Skript installiert alle Abhängigkeiten, richtet MariaDB ein, erstellt einen
 ## Schnellstart
 
 ```bash
-wget -O install_frappe_bench.sh https://raw.githubusercontent.com/<user>/<repo>/main/install_frappe_bench.sh
+wget -O install_frappe_bench.sh https://raw.githubusercontent.com/ManuelDell/frappe-installer/main/install_frappe_bench.sh
 chmod +x install_frappe_bench.sh
 sudo bash install_frappe_bench.sh
 ```
