@@ -1078,7 +1078,7 @@ PROD_FAILED=false
 PROD_CMD="
     export PATH=${BENCH_BIN_DIR}:\$HOME/.local/bin:/usr/local/bin:\$PATH
     cd ${BENCH_PATH}
-    sudo bench setup production ${BENCH_USER} --yes
+    bench setup production ${BENCH_USER} --yes
 "
 
 if [[ "$OUTPUT_MODE" == "verbose" ]]; then
@@ -1155,7 +1155,7 @@ ${GREEN}╔═══════════════════════
     Frappe:     ${FRAPPE_VERSION} (${FRAPPE_BRANCH})
     MariaDB:    $(mariadb --version 2>/dev/null | grep -oP 'Ver \K[^ ]+' || echo '?')
     Node.js:    $(node --version 2>/dev/null || echo '?')
-    Python:     $(${USER_PYTHON_BIN} --version 2>&1 || echo '?')
+    Python:     $(${USER_PYTHON_BIN} --version 2>/dev/null || run_as_user "${USER_PYTHON_BIN} --version" 2>/dev/null || echo '?')
     Bench CLI:  v${BENCH_VERSION}
 
   ${BOLD}Pfade${NC}
