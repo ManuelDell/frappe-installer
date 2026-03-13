@@ -1127,11 +1127,12 @@ if [[ -n "$SITE_NAME" ]]; then
 
     SITE_CMD="
         export PATH=${BENCH_BIN_DIR}:\$HOME/.local/bin:/usr/local/bin:\$PATH
-        cd ${BENCH_PATH}
+        cd ${BENCH_PATH} || { echo 'cd fehlgeschlagen'; exit 1; }
         bench new-site ${SITE_NAME} \
+            --db-root-username root \
             --mariadb-root-password '${MYSQL_ROOT_PASS}' \
             --admin-password '${ADMIN_PASS}' \
-            --no-mariadb-socket
+            --mariadb-user-host-login-scope='%'
     "
 
     if [[ "$OUTPUT_MODE" == "verbose" ]]; then
