@@ -446,43 +446,33 @@ if command -v debconf-set-selections &>/dev/null; then
     echo "mariadb-server mariadb-server/feedback_plugin_enable boolean false" | debconf-set-selections 2>/dev/null || true
 fi
 
-# ─── Vorherige Installation erkennen ──────────────────────────────────────────
+# ─── Vorherige Installation erkennen & aufräumen ─────────────────────────────
 
-CLEANUP_NEEDED=false
 EXISTING_ITEMS=()
 
-# Bench-Verzeichnis existiert?
-if [[ -d "${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}" ]]; then
-    EXISTING_ITEMS+=("Bench-Verzeichnis: ${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}")
-    CLEANUP_NEEDED=true
-fi
+# Bench-Verzeichnis
+BENCH_FULL="${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}"
+[[ -d "$BENCH_FULL" ]] && EXISTING_ITEMS+=("Bench-Verzeichnis: ${BENCH_FULL}")
 
-# User existiert mit altem bench/uv?
+# User mit altem bench/uv
 if id "$BENCH_USER" &>/dev/null; then
-    USER_HOME_CHECK="/home/${BENCH_USER}"
-    [[ -d "${USER_HOME_CHECK}/.local/share/uv" ]] && EXISTING_ITEMS+=("uv-Daten: ${USER_HOME_CHECK}/.local/share/uv/")
-    [[ -f "${USER_HOME_CHECK}/.local/bin/bench" ]] && EXISTING_ITEMS+=("bench CLI: ${USER_HOME_CHECK}/.local/bin/bench")
+    UH="/home/${BENCH_USER}"
+    [[ -d "${UH}/.local/share/uv" ]] && EXISTING_ITEMS+=("uv-Daten: ${UH}/.local/share/uv/")
+    [[ -f "${UH}/.local/bin/bench" ]] && EXISTING_ITEMS+=("bench CLI: ${UH}/.local/bin/bench")
 fi
 
-# Alte Node.js-Version?
+# Falsche Node.js-Version
 if command -v node &>/dev/null; then
     EXISTING_NODE_MAJOR=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
-    if [[ "$EXISTING_NODE_MAJOR" -ne "$NODE_VERSION" ]] 2>/dev/null; then
+    [[ "$EXISTING_NODE_MAJOR" -ne "$NODE_VERSION" ]] 2>/dev/null && \
         EXISTING_ITEMS+=("Node.js v${EXISTING_NODE_MAJOR} (benötigt: v${NODE_VERSION})")
-    fi
 fi
 
-# Alte Supervisor-Configs?
-if ls /etc/supervisor/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1; then
+# Supervisor/Nginx-Configs
+ls /etc/supervisor/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1 && \
     EXISTING_ITEMS+=("Supervisor-Config für ${BENCH_DIR}")
-    CLEANUP_NEEDED=true
-fi
-
-# Alte Nginx-Configs?
-if ls /etc/nginx/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1; then
+ls /etc/nginx/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1 && \
     EXISTING_ITEMS+=("Nginx-Config für ${BENCH_DIR}")
-    CLEANUP_NEEDED=true
-fi
 
 if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
     echo -e "\n${YELLOW}${BOLD}  ⚠  Vorherige Installation erkannt:${NC}"
@@ -490,72 +480,53 @@ if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
         echo -e "     • ${item}"
     done
     echo ""
-    echo -e "  ${BOLD}Optionen:${NC}"
-    echo "    1) Aufräumen — altes Bench-Verzeichnis, Configs und Caches löschen"
-    echo "    2) Überspringen — versuche trotzdem zu installieren (kann fehlschlagen)"
-    echo "    3) Abbrechen"
-    echo ""
-    while true; do
-        read -rp "$(echo -e "${BOLD}Auswahl [1/2/3]:${NC} ")" CLEANUP_CHOICE
-        case "$CLEANUP_CHOICE" in
-            1)
-                log_info "Räume auf..."
+    echo -e "  Bei der Installation werden alle bestehenden Instanzen gelöscht."
+    read -rp "$(echo -e "${BOLD}  Fortfahren? [j/N]:${NC} ")" CLEANUP_CONFIRM
 
-                # Supervisor-Prozesse stoppen
-                if command -v supervisorctl &>/dev/null; then
-                    supervisorctl stop all >> "$LOGFILE" 2>&1 || true
-                fi
+    if [[ ! "${CLEANUP_CONFIRM,,}" =~ ^(j|y)$ ]]; then
+        log_warn "Abgebrochen."
+        exit 0
+    fi
 
-                # Bench-Verzeichnis löschen
-                BENCH_FULL="${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}"
-                if [[ -d "$BENCH_FULL" ]]; then
-                    rm -rf "$BENCH_FULL"
-                    log_ok "Bench-Verzeichnis gelöscht: ${BENCH_FULL}"
-                fi
+    log_info "Räume auf..."
 
-                # Supervisor/Nginx-Configs entfernen
-                rm -f /etc/supervisor/conf.d/*"${BENCH_DIR}"* 2>/dev/null
-                rm -f /etc/nginx/conf.d/*"${BENCH_DIR}"* 2>/dev/null
-                supervisorctl reread >> "$LOGFILE" 2>&1 || true
-                supervisorctl update >> "$LOGFILE" 2>&1 || true
+    # Supervisor stoppen
+    if command -v supervisorctl &>/dev/null; then
+        supervisorctl stop all >> "$LOGFILE" 2>&1 || true
+    fi
 
-                # uv/bench Caches und Tools im User-Home
-                if id "$BENCH_USER" &>/dev/null; then
-                    UH="/home/${BENCH_USER}"
-                    rm -rf "${UH}/.local/share/uv" 2>/dev/null
-                    rm -f "${UH}/.local/bin/bench" 2>/dev/null
-                    log_ok "User-Caches aufgeräumt."
-                fi
+    # Bench-Verzeichnis löschen
+    if [[ -d "$BENCH_FULL" ]]; then
+        rm -rf "$BENCH_FULL"
+        log_ok "Gelöscht: ${BENCH_FULL}"
+    fi
 
-                # Alte Node.js deinstallieren wenn falsche Version
-                if command -v node &>/dev/null; then
-                    OLD_NODE=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
-                    if [[ "$OLD_NODE" -ne "$NODE_VERSION" ]] 2>/dev/null; then
-                        log_info "Entferne Node.js v${OLD_NODE}..."
-                        apt-get remove -y -qq nodejs >> "$LOGFILE" 2>&1 || true
-                        apt-get autoremove -y -qq >> "$LOGFILE" 2>&1 || true
-                        # NodeSource-Repo entfernen
-                        rm -f /etc/apt/sources.list.d/nodesource.list 2>/dev/null
-                        log_ok "Node.js v${OLD_NODE} entfernt."
-                    fi
-                fi
+    # Supervisor/Nginx-Configs entfernen
+    rm -f /etc/supervisor/conf.d/*"${BENCH_DIR}"* 2>/dev/null
+    rm -f /etc/nginx/conf.d/*"${BENCH_DIR}"* 2>/dev/null
+    supervisorctl reread >> "$LOGFILE" 2>&1 || true
+    supervisorctl update >> "$LOGFILE" 2>&1 || true
 
-                log_ok "Aufräumen abgeschlossen."
-                break
-                ;;
-            2)
-                log_warn "Überspringe Aufräumen — Fehler möglich!"
-                break
-                ;;
-            3)
-                log_warn "Abgebrochen."
-                exit 0
-                ;;
-            *)
-                echo "  Bitte 1, 2 oder 3."
-                ;;
-        esac
-    done
+    # uv/bench im User-Home
+    if id "$BENCH_USER" &>/dev/null; then
+        UH="/home/${BENCH_USER}"
+        rm -rf "${UH}/.local/share/uv" 2>/dev/null
+        rm -f "${UH}/.local/bin/bench" 2>/dev/null
+        log_ok "User-Caches bereinigt."
+    fi
+
+    # Falsche Node.js entfernen
+    if command -v node &>/dev/null; then
+        OLD_NODE=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
+        if [[ "$OLD_NODE" -ne "$NODE_VERSION" ]] 2>/dev/null; then
+            apt-get remove -y -qq nodejs >> "$LOGFILE" 2>&1 || true
+            apt-get autoremove -y -qq >> "$LOGFILE" 2>&1 || true
+            rm -f /etc/apt/sources.list.d/nodesource.list 2>/dev/null
+            log_ok "Node.js v${OLD_NODE} entfernt."
+        fi
+    fi
+
+    log_ok "Aufräumen abgeschlossen."
     echo ""
 fi
 
