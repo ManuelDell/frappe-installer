@@ -335,10 +335,12 @@ if [[ "$QUICK_INSTALL" == true ]]; then
     echo -e "    Site:       ${SITE_NAME}"
     echo -e "    Passwörter: werden automatisch generiert → ${PWD_FILE}"
     echo ""
-    read -rp "$(echo -e "${BOLD}Starten? [J/n]:${NC} ")" CONFIRM
-    CONFIRM="${CONFIRM:-j}"
-    [[ ! "${CONFIRM,,}" =~ ^(j|y)$ ]] && log_warn "Abgebrochen." && exit 0
-    echo ""
+    echo -ne "  ${DIM}Startet in: ${NC}"
+    for i in 3 2 1; do
+        echo -ne "${BOLD}${i}${NC}${DIM}...${NC} "
+        sleep 1
+    done
+    echo -e "\n  ${DIM}(Abbruch: Ctrl+C)${NC}\n"
 
 else
 
