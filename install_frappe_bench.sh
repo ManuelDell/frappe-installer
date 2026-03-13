@@ -6,19 +6,19 @@
 #  Ausführen als: root
 #
 #  Features:
+#    • Quick-Install-Modus (vollautomatisch, v16, Passwörter generiert)
 #    • Wahl zwischen Fortschrittsbalken und Verbose-Modus
 #    • Vollständiges Logfile in beiden Modi
 #    • Debian-LXC-kompatibel (Pakete einzeln, fehlende = Warnung)
 #    • Automatische Reparatur bei bench init Problemen
 #    • Production-Setup mit Supervisor + Nginx
+#    • Automatischer MariaDB-Datenbank-Cleanup bei Neuinstallation
 #
 #  Autor: Dells Dienste
 #  Datum: 2026-03-13
 ###############################################################################
 
 set -euo pipefail
-# KEIN custom IFS! Standard-IFS (space/tab/newline) ist nötig damit
-# Word-Splitting bei apt-get etc. korrekt funktioniert.
 
 # ─── Logfile ───────────────────────────────────────────────────────────────────
 
@@ -118,7 +118,6 @@ step_start() {
 
 # ─── Befehl-Wrapper ───────────────────────────────────────────────────────────
 
-# Führt einen Befehl aus. Jedes Argument wird korrekt durchgereicht.
 run_cmd() {
     local description="$1"
     shift
@@ -154,17 +153,6 @@ run_cmd_or_die() {
 
 # ─── LXC-sicherer Service-Controller ──────────────────────────────────────────
 
-# systemctl in LXC-Containern kann bei D-Bus-Fehlern rc=1 liefern,
-# obwohl der Dienst tatsächlich läuft. Diese Funktion:
-#   1. Versucht systemctl
-#   2. Bei Fehler: prüft ob der Dienst WIRKLICH läuft (pgrep/pidof)
-#   3. Nur wenn Dienst tatsächlich nicht läuft → Fehler
-#
-# Nutzung: svc_ctl <action> <service> [<process_name>]
-#   action:       enable|start|stop|restart
-#   service:      systemd service name (z.B. mariadb)
-#   process_name: Prozessname für pgrep-Check (optional, default=service)
-
 svc_ctl() {
     local action="$1"
     local service="$2"
@@ -172,7 +160,6 @@ svc_ctl() {
 
     log_to_file "SVC: systemctl ${action} ${service}"
 
-    # Versuche systemctl
     if systemctl "$action" "$service" >> "$LOGFILE" 2>&1; then
         log_to_file "SVC OK: systemctl ${action} ${service}"
         return 0
@@ -181,13 +168,11 @@ svc_ctl() {
     local rc=$?
     log_to_file "SVC WARN: systemctl ${action} ${service} rc=${rc} (D-Bus?)"
 
-    # enable braucht keinen Laufzeit-Check
     if [[ "$action" == "enable" ]]; then
         log_to_file "SVC: enable fehlgeschlagen, aber nicht kritisch in LXC"
         return 0
     fi
 
-    # stop soll stoppen — prüfe ob Prozess weg ist
     if [[ "$action" == "stop" ]]; then
         sleep 1
         if ! pgrep -x "$process_name" > /dev/null 2>&1; then
@@ -198,7 +183,6 @@ svc_ctl() {
         return 1
     fi
 
-    # start/restart — warte kurz, dann prüfe ob Prozess läuft
     sleep 2
 
     if pgrep -x "$process_name" > /dev/null 2>&1; then
@@ -206,7 +190,6 @@ svc_ctl() {
         return 0
     fi
 
-    # Zweiter Versuch: mit service-Befehl (SysV-kompatibel)
     log_to_file "SVC: Fallback → service ${service} ${action}"
     if service "$service" "$action" >> "$LOGFILE" 2>&1; then
         sleep 2
@@ -216,7 +199,6 @@ svc_ctl() {
         fi
     fi
 
-    # Dritter Versuch: Prozess direkt starten (nur MariaDB/Redis)
     if [[ "$action" =~ ^(start|restart)$ ]]; then
         case "$service" in
             mariadb|mysql)
@@ -244,11 +226,8 @@ svc_ctl() {
     return 1
 }
 
-# ─── Paket-Installer (Kernfix!) ───────────────────────────────────────────────
+# ─── Paket-Installer ──────────────────────────────────────────────────────────
 
-# Installiert jedes Paket einzeln. Fehlende optionale Pakete = Warnung.
-# $1 = "required" oder "optional"
-# $2... = Paketnamen
 FAILED_PKGS=()
 INSTALLED_PKGS=()
 
@@ -270,6 +249,12 @@ install_pkg() {
             fi
         fi
     done
+}
+
+# ─── Passwort-Generator ───────────────────────────────────────────────────────
+
+generate_password() {
+    tr -dc 'A-Za-z0-9!@#%^&*' < /dev/urandom | head -c 20
 }
 
 # ─── Voraussetzungen ──────────────────────────────────────────────────────────
@@ -308,182 +293,247 @@ ${BOLD}${CYAN}╔═════════════════════
   Logfile: ${LOGFILE}
 "
 
-# ─── Modus ─────────────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+#  INSTALLATIONS-MODUS
+# ═══════════════════════════════════════════════════════════════════════════════
 
-echo -e "${BOLD}Ausgabe-Modus:${NC}"
-echo "  1) Fortschrittsbalken  — sauber, Details im Logfile"
-echo "  2) Verbose             — alles live auf dem Terminal"
+QUICK_INSTALL=false
+
+echo -e "${BOLD}Installations-Modus:${NC}"
+echo "  1) Interaktiv      — Frappe-Version, Benutzer, Pfad, Passwörter selbst wählen"
+echo "  2) Quick-Install   — Vollautomatisch (v16, user: frappe, bench: ~/frappe-bench,"
+echo "                       site: frappe.localhost, Passwörter generiert + in ~/pwd.txt)"
 echo ""
 while true; do
-    read -rp "Auswahl [1/2] (Standard: 1): " MODE_CHOICE
-    MODE_CHOICE="${MODE_CHOICE:-1}"
-    case "$MODE_CHOICE" in
-        1) OUTPUT_MODE="progress"; break ;;
-        2) OUTPUT_MODE="verbose";  break ;;
+    read -rp "Auswahl [1/2] (Standard: 1): " INSTALL_MODE_CHOICE
+    INSTALL_MODE_CHOICE="${INSTALL_MODE_CHOICE:-1}"
+    case "$INSTALL_MODE_CHOICE" in
+        1) QUICK_INSTALL=false; break ;;
+        2) QUICK_INSTALL=true;  break ;;
         *) echo "  Bitte 1 oder 2." ;;
     esac
 done
 echo ""
 
-# ─── Frappe-Version ────────────────────────────────────────────────────────────
+# ─── Quick-Install: Werte setzen ──────────────────────────────────────────────
 
-echo -e "${BOLD}Frappe-Version:${NC}"
-echo "  1) version-15  (stable — Python 3.10+, Node 20, MariaDB 10.x)"
-echo "  2) version-16  (develop — Python 3.14, Node 24, MariaDB 11.8)"
-echo ""
-while true; do
-    read -rp "Auswahl [1/2] (Standard: 1): " VERSION_CHOICE
-    VERSION_CHOICE="${VERSION_CHOICE:-1}"
-    case "$VERSION_CHOICE" in
-        1) FRAPPE_BRANCH="version-15"; break ;;
-        2) FRAPPE_BRANCH="version-16"; break ;;
-        *) echo "  Bitte 1 oder 2." ;;
-    esac
-done
-log_ok "Branch: ${FRAPPE_BRANCH}"
-echo ""
+if [[ "$QUICK_INSTALL" == true ]]; then
+    OUTPUT_MODE="progress"
+    FRAPPE_BRANCH="version-16"
+    BENCH_USER="frappe"
+    BENCH_DIR="frappe-bench"
+    BENCH_PATH="/home/${BENCH_USER}/${BENCH_DIR}"
+    SITE_NAME="frappe.localhost"
+    MYSQL_ROOT_PASS=$(generate_password)
+    ADMIN_PASS=$(generate_password)
+    PWD_FILE="/home/${BENCH_USER}/pwd.txt"
 
-# ─── Benutzername ──────────────────────────────────────────────────────────────
+    echo -e "${GREEN}${BOLD}  Quick-Install aktiviert:${NC}"
+    echo -e "    Branch:     ${FRAPPE_BRANCH}"
+    echo -e "    Benutzer:   ${BENCH_USER}"
+    echo -e "    Bench:      ${BENCH_PATH}"
+    echo -e "    Site:       ${SITE_NAME}"
+    echo -e "    Passwörter: werden automatisch generiert → ${PWD_FILE}"
+    echo ""
+    read -rp "$(echo -e "${BOLD}Starten? [J/n]:${NC} ")" CONFIRM
+    CONFIRM="${CONFIRM:-j}"
+    [[ ! "${CONFIRM,,}" =~ ^(j|y)$ ]] && log_warn "Abgebrochen." && exit 0
+    echo ""
 
-while true; do
-    read -rp "$(echo -e "${BOLD}Linux-Benutzername${NC} (z.B. frappe): ")" BENCH_USER
-    BENCH_USER="${BENCH_USER:-frappe}"
-    [[ "$BENCH_USER" =~ ^[a-z][a-z0-9_-]*$ ]] && break
-    echo "  Nur Kleinbuchstaben, Zahlen, '-', '_' (Anfang: Buchstabe)."
-done
-log_ok "Benutzer: ${BENCH_USER}"
-echo ""
+else
 
-# ─── Bench-Ordner ─────────────────────────────────────────────────────────────
+    # ─── Ausgabe-Modus ──────────────────────────────────────────────────────────
 
-while true; do
-    read -rp "$(echo -e "${BOLD}Bench-Ordnername${NC} (in /home/${BENCH_USER}/): ")" BENCH_DIR
-    BENCH_DIR="${BENCH_DIR:-frappe-bench}"
-    [[ "$BENCH_DIR" =~ ^[a-zA-Z][a-zA-Z0-9_.-]*$ ]] && break
-    echo "  Nur Buchstaben, Zahlen, '.', '-', '_'."
-done
-BENCH_PATH="/home/${BENCH_USER}/${BENCH_DIR}"
-log_ok "Pfad: ${BENCH_PATH}"
-echo ""
-
-# ─── MariaDB Root-Passwort ────────────────────────────────────────────────────
-
-while true; do
-    read -rsp "$(echo -e "${BOLD}MariaDB Root-Passwort:${NC} ")" MYSQL_ROOT_PASS; echo ""
-    [[ -z "$MYSQL_ROOT_PASS" ]] && echo "  Darf nicht leer sein." && continue
-    [[ ${#MYSQL_ROOT_PASS} -lt 6 ]] && echo "  Min. 6 Zeichen." && continue
-    read -rsp "$(echo -e "${BOLD}Bestätigen:${NC} ")" MYSQL_ROOT_PASS_CONFIRM; echo ""
-    [[ "$MYSQL_ROOT_PASS" == "$MYSQL_ROOT_PASS_CONFIRM" ]] && break
-    echo "  Stimmt nicht überein."
-done
-log_ok "MariaDB Root-Passwort gesetzt."
-echo ""
-
-# ─── Optionale Site ────────────────────────────────────────────────────────────
-
-read -rp "$(echo -e "${BOLD}Gleich eine Site erstellen?${NC} [j/N]: ")" CREATE_SITE
-CREATE_SITE="${CREATE_SITE:-n}"
-SITE_NAME=""
-ADMIN_PASS=""
-
-if [[ "${CREATE_SITE,,}" =~ ^(j|y)$ ]]; then
+    echo -e "${BOLD}Ausgabe-Modus:${NC}"
+    echo "  1) Fortschrittsbalken  — sauber, Details im Logfile"
+    echo "  2) Verbose             — alles live auf dem Terminal"
     echo ""
     while true; do
-        read -rp "$(echo -e "${BOLD}Site-Name${NC} (z.B. erp.example.com): ")" SITE_NAME
-        [[ -n "$SITE_NAME" && "$SITE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+$ ]] && break
-        echo "  Ungültiger Name."
+        read -rp "Auswahl [1/2] (Standard: 1): " MODE_CHOICE
+        MODE_CHOICE="${MODE_CHOICE:-1}"
+        case "$MODE_CHOICE" in
+            1) OUTPUT_MODE="progress"; break ;;
+            2) OUTPUT_MODE="verbose";  break ;;
+            *) echo "  Bitte 1 oder 2." ;;
+        esac
     done
+    echo ""
+
+    # ─── Frappe-Version ─────────────────────────────────────────────────────────
+
+    echo -e "${BOLD}Frappe-Version:${NC}"
+    echo "  1) version-15  (stable — Python 3.10+, Node 20, MariaDB 10.x)"
+    echo "  2) version-16  (develop — Python 3.14, Node 24, MariaDB 11.8)"
+    echo ""
     while true; do
-        read -rsp "$(echo -e "${BOLD}Admin-Passwort:${NC} ")" ADMIN_PASS; echo ""
-        [[ -z "$ADMIN_PASS" ]] && echo "  Darf nicht leer sein." && continue
-        read -rsp "$(echo -e "${BOLD}Bestätigen:${NC} ")" ADMIN_PASS_CONFIRM; echo ""
-        [[ "$ADMIN_PASS" == "$ADMIN_PASS_CONFIRM" ]] && break
+        read -rp "Auswahl [1/2] (Standard: 1): " VERSION_CHOICE
+        VERSION_CHOICE="${VERSION_CHOICE:-1}"
+        case "$VERSION_CHOICE" in
+            1) FRAPPE_BRANCH="version-15"; break ;;
+            2) FRAPPE_BRANCH="version-16"; break ;;
+            *) echo "  Bitte 1 oder 2." ;;
+        esac
+    done
+    log_ok "Branch: ${FRAPPE_BRANCH}"
+    echo ""
+
+    # ─── Benutzername ────────────────────────────────────────────────────────────
+
+    while true; do
+        read -rp "$(echo -e "${BOLD}Linux-Benutzername${NC} (z.B. frappe): ")" BENCH_USER
+        BENCH_USER="${BENCH_USER:-frappe}"
+        [[ "$BENCH_USER" =~ ^[a-z][a-z0-9_-]*$ ]] && break
+        echo "  Nur Kleinbuchstaben, Zahlen, '-', '_' (Anfang: Buchstabe)."
+    done
+    log_ok "Benutzer: ${BENCH_USER}"
+    echo ""
+
+    # ─── Bench-Ordner ───────────────────────────────────────────────────────────
+
+    while true; do
+        read -rp "$(echo -e "${BOLD}Bench-Ordnername${NC} (in /home/${BENCH_USER}/): ")" BENCH_DIR
+        BENCH_DIR="${BENCH_DIR:-frappe-bench}"
+        [[ "$BENCH_DIR" =~ ^[a-zA-Z][a-zA-Z0-9_.-]*$ ]] && break
+        echo "  Nur Buchstaben, Zahlen, '.', '-', '_'."
+    done
+    BENCH_PATH="/home/${BENCH_USER}/${BENCH_DIR}"
+    log_ok "Pfad: ${BENCH_PATH}"
+    echo ""
+
+    # ─── MariaDB Root-Passwort ───────────────────────────────────────────────────
+
+    while true; do
+        read -rsp "$(echo -e "${BOLD}MariaDB Root-Passwort:${NC} ")" MYSQL_ROOT_PASS; echo ""
+        [[ -z "$MYSQL_ROOT_PASS" ]] && echo "  Darf nicht leer sein." && continue
+        [[ ${#MYSQL_ROOT_PASS} -lt 6 ]] && echo "  Min. 6 Zeichen." && continue
+        read -rsp "$(echo -e "${BOLD}Bestätigen:${NC} ")" MYSQL_ROOT_PASS_CONFIRM; echo ""
+        [[ "$MYSQL_ROOT_PASS" == "$MYSQL_ROOT_PASS_CONFIRM" ]] && break
         echo "  Stimmt nicht überein."
     done
-fi
+    log_ok "MariaDB Root-Passwort gesetzt."
+    echo ""
 
-# ─── Zusammenfassung ──────────────────────────────────────────────────────────
+    # ─── Optionale Site ──────────────────────────────────────────────────────────
 
-echo -e "
+    read -rp "$(echo -e "${BOLD}Gleich eine Site erstellen?${NC} [j/N]: ")" CREATE_SITE
+    CREATE_SITE="${CREATE_SITE:-n}"
+    SITE_NAME=""
+    ADMIN_PASS=""
+
+    if [[ "${CREATE_SITE,,}" =~ ^(j|y)$ ]]; then
+        echo ""
+        while true; do
+            read -rp "$(echo -e "${BOLD}Site-Name${NC} (z.B. erp.example.com): ")" SITE_NAME
+            [[ -n "$SITE_NAME" && "$SITE_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9.-]+$ ]] && break
+            echo "  Ungültiger Name."
+        done
+        while true; do
+            read -rsp "$(echo -e "${BOLD}Admin-Passwort:${NC} ")" ADMIN_PASS; echo ""
+            [[ -z "$ADMIN_PASS" ]] && echo "  Darf nicht leer sein." && continue
+            read -rsp "$(echo -e "${BOLD}Bestätigen:${NC} ")" ADMIN_PASS_CONFIRM; echo ""
+            [[ "$ADMIN_PASS" == "$ADMIN_PASS_CONFIRM" ]] && break
+            echo "  Stimmt nicht überein."
+        done
+    fi
+
+    PWD_FILE=""
+
+    # ─── Zusammenfassung ─────────────────────────────────────────────────────────
+
+    echo -e "
 ${BOLD}═══ Zusammenfassung ═══${NC}
   Modus:         $([ "$OUTPUT_MODE" = "progress" ] && echo "Fortschrittsbalken" || echo "Verbose")
   Branch:        ${FRAPPE_BRANCH}
   Benutzer:      ${BENCH_USER}
   Bench-Pfad:    ${BENCH_PATH}
   MariaDB Root:  (gesetzt)"
-[[ -n "$SITE_NAME" ]] && echo "  Site:          ${SITE_NAME}"
-echo ""
+    [[ -n "$SITE_NAME" ]] && echo "  Site:          ${SITE_NAME}"
+    echo ""
 
-read -rp "$(echo -e "${BOLD}Starten? [J/n]:${NC} ")" CONFIRM
-CONFIRM="${CONFIRM:-j}"
-[[ ! "${CONFIRM,,}" =~ ^(j|y)$ ]] && log_warn "Abgebrochen." && exit 0
-echo ""
+    read -rp "$(echo -e "${BOLD}Starten? [J/n]:${NC} ")" CONFIRM
+    CONFIRM="${CONFIRM:-j}"
+    [[ ! "${CONFIRM,,}" =~ ^(j|y)$ ]] && log_warn "Abgebrochen." && exit 0
+    echo ""
+
+fi
 
 # ─── Versions-Variablen ───────────────────────────────────────────────────────
-# Quelle: https://docs.frappe.io/framework/user/en/installation
-#
-# v14/v15: Python 3.10+, Node 18+, MariaDB 10.6.6+
-# v16:     Python 3.14,  Node 24,  MariaDB 11.8
 
 if [[ "$FRAPPE_BRANCH" == "version-15" ]]; then
-    PYTHON_MIN="3.10"           # Minimum laut Doku
-    PYTHON_EXACT=""             # Kein exaktes Match nötig, >=3.10 reicht
-    NODE_VERSION="20"           # 18 ist EOL, 20 LTS ist sicher
-    USE_UV=true                 # uv für bench CLI Installation (immer)
-    MARIADB_FROM_REPO=false     # System-MariaDB (10.x) reicht
+    PYTHON_MIN="3.10"
+    PYTHON_EXACT=""
+    NODE_VERSION="20"
+    USE_UV=true
+    MARIADB_FROM_REPO=false
 else
-    PYTHON_MIN="3.14"           # Exakt 3.14.x erforderlich
-    PYTHON_EXACT="3.14"         # bench init/pip erzwingt >=3.14,<3.15
+    PYTHON_MIN="3.14"
+    PYTHON_EXACT="3.14"
     NODE_VERSION="24"
-    USE_UV=true                 # uv für Python 3.14 + bench CLI
-    MARIADB_FROM_REPO=true      # MariaDB 11.8 aus offiziellem Repo
+    USE_UV=true
+    MARIADB_FROM_REPO=true
 fi
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #                          INSTALLATION
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# Alle apt/dpkg-Dialoge unterdrücken — das Skript fragt selbst alles ab!
 export DEBIAN_FRONTEND=noninteractive
 export DEBCONF_NONINTERACTIVE_SEEN=true
 
-# MariaDB Feedback-Plugin vorab auf "No" setzen (verhindert ncurses-Dialog)
 if command -v debconf-set-selections &>/dev/null; then
-    echo "mariadb-server mariadb-server/feedback_plugin_enable boolean false" | debconf-set-selections 2>/dev/null || true
+    echo "mariadb-server mariadb-server/feedback_plugin_enable boolean false" \
+        | debconf-set-selections 2>/dev/null || true
 fi
 
-# ─── Vorherige Installation erkennen & aufräumen ─────────────────────────────
+# ─── Vorherige Installation erkennen & aufräumen ──────────────────────────────
 
 EXISTING_ITEMS=()
 
-# Bench-Verzeichnis
-BENCH_FULL="${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}"
+BENCH_FULL="${BENCH_PATH}"
 [[ -d "$BENCH_FULL" ]] && EXISTING_ITEMS+=("Bench-Verzeichnis: ${BENCH_FULL}")
 
-# User mit altem bench/uv/pip-Resten
 if id "$BENCH_USER" &>/dev/null; then
     UH="/home/${BENCH_USER}"
-    [[ -d "${UH}/.local/share/uv" ]]    && EXISTING_ITEMS+=("uv-Daten: ${UH}/.local/share/uv/")
-    [[ -f "${UH}/.local/bin/bench" ]]    && EXISTING_ITEMS+=("bench CLI: ${UH}/.local/bin/bench")
-    [[ -f "${UH}/.local/bin/uv" ]]       && EXISTING_ITEMS+=("uv Binary: ${UH}/.local/bin/uv")
-    # pip-installierte bench-Reste
+    [[ -d "${UH}/.local/share/uv" ]] && EXISTING_ITEMS+=("uv-Daten: ${UH}/.local/share/uv/")
+    [[ -f "${UH}/.local/bin/bench" ]] && EXISTING_ITEMS+=("bench CLI: ${UH}/.local/bin/bench")
+    [[ -f "${UH}/.local/bin/uv" ]]    && EXISTING_ITEMS+=("uv Binary: ${UH}/.local/bin/uv")
     if find "${UH}/.local/lib" -path "*/site-packages/bench" -type d 2>/dev/null | grep -q .; then
         EXISTING_ITEMS+=("pip bench-Pakete: ${UH}/.local/lib/")
     fi
 fi
 
-# Falsche Node.js-Version
 if command -v node &>/dev/null; then
     EXISTING_NODE_MAJOR=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
     [[ "$EXISTING_NODE_MAJOR" -ne "$NODE_VERSION" ]] 2>/dev/null && \
         EXISTING_ITEMS+=("Node.js v${EXISTING_NODE_MAJOR} (benötigt: v${NODE_VERSION})")
 fi
 
-# Supervisor/Nginx-Configs
 ls /etc/supervisor/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1 && \
     EXISTING_ITEMS+=("Supervisor-Config für ${BENCH_DIR}")
 ls /etc/nginx/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1 && \
     EXISTING_ITEMS+=("Nginx-Config für ${BENCH_DIR}")
+
+# MariaDB: Nicht-System-DBs ermitteln (immer prüfen, auch ohne laufende Instanz)
+MARIADB_EXTRA_DBS=()
+DB_CLIENT=""
+if command -v mariadb &>/dev/null; then
+    DB_CLIENT="mariadb"
+elif command -v mysql &>/dev/null; then
+    DB_CLIENT="mysql"
+fi
+
+if [[ -n "$DB_CLIENT" ]]; then
+    # Verbindung ohne Passwort versuchen (fresh install oder socket-auth)
+    while IFS= read -r db; do
+        [[ -z "$db" || "$db" == "Database" ]] && continue
+        MARIADB_EXTRA_DBS+=("$db")
+    done < <("$DB_CLIENT" -u root --connect-timeout=5 -e "SHOW DATABASES;" 2>/dev/null \
+        | grep -v -E "^(Database|mysql|information_schema|performance_schema|sys)$" || true)
+
+    if [[ ${#MARIADB_EXTRA_DBS[@]} -gt 0 ]]; then
+        EXISTING_ITEMS+=("MariaDB-Datenbanken (${#MARIADB_EXTRA_DBS[@]}): ${MARIADB_EXTRA_DBS[*]}")
+    fi
+fi
 
 if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
     echo -e "\n${YELLOW}${BOLD}  ⚠  Vorherige Installation erkannt:${NC}"
@@ -491,12 +541,16 @@ if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
         echo -e "     • ${item}"
     done
     echo ""
-    echo -e "  Bei der Installation werden alle bestehenden Instanzen gelöscht."
-    read -rp "$(echo -e "${BOLD}  Fortfahren? [j/N]:${NC} ")" CLEANUP_CONFIRM
+    echo -e "  Alle bestehenden Instanzen und MariaDB-Datenbanken werden gelöscht."
 
-    if [[ ! "${CLEANUP_CONFIRM,,}" =~ ^(j|y)$ ]]; then
-        log_warn "Abgebrochen."
-        exit 0
+    if [[ "$QUICK_INSTALL" == false ]]; then
+        read -rp "$(echo -e "${BOLD}  Fortfahren und alles löschen? [j/N]:${NC} ")" CLEANUP_CONFIRM
+        if [[ ! "${CLEANUP_CONFIRM,,}" =~ ^(j|y)$ ]]; then
+            log_warn "Abgebrochen."
+            exit 0
+        fi
+    else
+        echo -e "  ${DIM}(Quick-Install: automatisch fortfahren)${NC}"
     fi
 
     log_info "Räume auf..."
@@ -518,28 +572,17 @@ if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
     supervisorctl reread >> "$LOGFILE" 2>&1 || true
     supervisorctl update >> "$LOGFILE" 2>&1 || true
 
-    # 4. KOMPLETTES User-lokales Environment bereinigen
-    #    bench/uv/pip legen alles unter ~/.local/ ab — sauber entfernen
+    # 4. User-lokales Environment bereinigen
     if id "$BENCH_USER" &>/dev/null; then
         UH="/home/${BENCH_USER}"
-
-        # uv komplett
-        rm -rf "${UH}/.local/share/uv" 2>/dev/null
-        rm -rf "${UH}/.cache/uv" 2>/dev/null
-
-        # bench CLI (egal ob via uv oder pip installiert)
-        rm -f "${UH}/.local/bin/bench" 2>/dev/null
-
-        # pip-installierte bench und Abhängigkeiten
-        # (löscht site-packages/bench*, site-packages/frappe_bench*)
+        rm -rf "${UH}/.local/share/uv"  2>/dev/null
+        rm -rf "${UH}/.cache/uv"        2>/dev/null
+        rm -f  "${UH}/.local/bin/bench" 2>/dev/null
         find "${UH}/.local/lib" -maxdepth 4 -type d \
             \( -name "bench" -o -name "bench-*" -o -name "frappe_bench*" \) \
             -exec rm -rf {} + 2>/dev/null || true
-
-        # uv-Binary (wird in Schritt 9 neu installiert)
-        rm -f "${UH}/.local/bin/uv" "${UH}/.local/bin/uvx" 2>/dev/null
-        rm -f "${UH}/.cargo/bin/uv" "${UH}/.cargo/bin/uvx" 2>/dev/null
-
+        rm -f "${UH}/.local/bin/uv"   "${UH}/.local/bin/uvx"  2>/dev/null
+        rm -f "${UH}/.cargo/bin/uv"   "${UH}/.cargo/bin/uvx"  2>/dev/null
         log_ok "User-Environment bereinigt: ${UH}/.local/"
     fi
 
@@ -548,17 +591,38 @@ if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
         OLD_NODE=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
         if [[ "$OLD_NODE" -ne "$NODE_VERSION" ]] 2>/dev/null; then
             apt-get remove -y -qq nodejs >> "$LOGFILE" 2>&1 || true
-            apt-get autoremove -y -qq >> "$LOGFILE" 2>&1 || true
+            apt-get autoremove -y -qq    >> "$LOGFILE" 2>&1 || true
             rm -f /etc/apt/sources.list.d/nodesource* 2>/dev/null
-            rm -f /etc/apt/keyrings/nodesource* 2>/dev/null
+            rm -f /etc/apt/keyrings/nodesource*       2>/dev/null
             log_ok "Node.js v${OLD_NODE} entfernt."
         fi
     fi
 
-    # 6. Auch root-uv-Reste entfernen (von früheren Skript-Versionen)
+    # 6. Root-uv-Reste entfernen
     rm -rf /root/.local/share/uv 2>/dev/null
-    rm -rf /root/.cache/uv 2>/dev/null
-    rm -f /root/uv.toml 2>/dev/null
+    rm -rf /root/.cache/uv       2>/dev/null
+    rm -f  /root/uv.toml         2>/dev/null
+
+    # 7. MariaDB: Alle Nicht-System-Datenbanken + zugehörige User löschen
+    if [[ ${#MARIADB_EXTRA_DBS[@]} -gt 0 && -n "$DB_CLIENT" ]]; then
+        log_info "Lösche MariaDB-Datenbanken: ${MARIADB_EXTRA_DBS[*]}"
+        for db in "${MARIADB_EXTRA_DBS[@]}"; do
+            if "$DB_CLIENT" -u root --connect-timeout=5 \
+                    -e "DROP DATABASE IF EXISTS \`${db}\`;" >> "$LOGFILE" 2>&1; then
+                log_ok "DB gelöscht: ${db}"
+            else
+                log_warn "DB löschen fehlgeschlagen: ${db}"
+            fi
+            # Frappe-Konvention: DB-User hat denselben Namen wie die DB
+            "$DB_CLIENT" -u root --connect-timeout=5 \
+                -e "DROP USER IF EXISTS '${db}'@'localhost';" >> "$LOGFILE" 2>&1 || true
+            "$DB_CLIENT" -u root --connect-timeout=5 \
+                -e "DROP USER IF EXISTS '${db}'@'%';"         >> "$LOGFILE" 2>&1 || true
+        done
+        "$DB_CLIENT" -u root --connect-timeout=5 \
+            -e "FLUSH PRIVILEGES;" >> "$LOGFILE" 2>&1 || true
+        log_ok "MariaDB-Cleanup abgeschlossen."
+    fi
 
     log_ok "Aufräumen abgeschlossen."
     echo ""
@@ -576,50 +640,18 @@ log_ok "System aktualisiert."
 
 step_start 2 "Abhängigkeiten installieren"
 
-# Pflicht-Pakete: jedes einzeln — kein Gruppieren, kein Word-Splitting-Problem
 REQUIRED_PKGS=(
-    git
-    curl
-    wget
-    sudo
-    gnupg2
-    ca-certificates
-    lsb-release
-    apt-transport-https
-    build-essential
-    python3-dev
-    python3-setuptools
-    python3-venv
-    libffi-dev
-    libssl-dev
-    libjpeg-dev
-    zlib1g-dev
-    libfreetype6-dev
-    liblcms2-dev
-    libwebp-dev
-    libharfbuzz-dev
-    libfribidi-dev
-    libxcb1-dev
-    libpq-dev
-    libmariadb-dev
-    pkg-config
-    libldap2-dev
-    libsasl2-dev
-    redis-server
-    supervisor
-    nginx
-    xvfb
-    libfontconfig
-    fontconfig
-    cron
+    git curl wget sudo gnupg2 ca-certificates lsb-release
+    apt-transport-https build-essential python3-dev python3-setuptools
+    python3-venv libffi-dev libssl-dev libjpeg-dev zlib1g-dev
+    libfreetype6-dev liblcms2-dev libwebp-dev libharfbuzz-dev
+    libfribidi-dev libxcb1-dev libpq-dev libmariadb-dev pkg-config
+    libldap2-dev libsasl2-dev redis-server supervisor nginx
+    xvfb libfontconfig fontconfig cron
 )
 
-# Optionale Pakete: Fehlen ist OK (Minimal-Debian, LXC)
 OPTIONAL_PKGS=(
-    software-properties-common
-    python3-pip
-    python3-distutils
-    fail2ban
+    software-properties-common python3-pip python3-distutils fail2ban
 )
 
 log_to_file "Installiere ${#REQUIRED_PKGS[@]} Pflicht-Pakete einzeln..."
@@ -635,7 +667,6 @@ if [[ ${#FAILED_PKGS[@]} -gt 0 ]]; then
 fi
 log_ok "${#INSTALLED_PKGS[@]} Pakete installiert."
 
-# Kritische Pakete prüfen
 CRITICAL_MISSING=()
 for pkg in git curl build-essential python3-dev redis-server supervisor nginx; do
     if ! dpkg -l "$pkg" 2>/dev/null | grep -q "^ii"; then
@@ -699,10 +730,8 @@ MARIADB_CNF
 
 svc_ctl restart mariadb mariadbd || true
 
-# Warte kurz, dann prüfe ob MariaDB wirklich antwortet
 sleep 2
 if ! mariadb -u root -e "SELECT 1;" >> "$LOGFILE" 2>&1; then
-    # Noch ein Versuch
     sleep 3
     mariadb -u root -e "SELECT 1;" >> "$LOGFILE" 2>&1 || \
         log_warn "MariaDB antwortet nicht nach Restart — Config evtl. fehlerhaft."
@@ -752,29 +781,25 @@ if command -v node &>/dev/null; then
     if [[ "$EXISTING_MAJOR" -eq "$NODE_VERSION" ]] 2>/dev/null; then
         NEED_NODE=false
     else
-        # Falsche Node-Version → gründlich entfernen
         log_info "Node.js v${EXISTING_MAJOR} gefunden, benötigt v${NODE_VERSION} — ersetze..."
         apt-get remove -y -qq nodejs >> "$LOGFILE" 2>&1 || true
-        apt-get autoremove -y -qq >> "$LOGFILE" 2>&1 || true
-        # Alle NodeSource-Repos entfernen
+        apt-get autoremove -y -qq    >> "$LOGFILE" 2>&1 || true
         rm -f /etc/apt/sources.list.d/nodesource* 2>/dev/null
-        rm -f /etc/apt/keyrings/nodesource* 2>/dev/null
-        rm -f /usr/share/keyrings/nodesource* 2>/dev/null
+        rm -f /etc/apt/keyrings/nodesource*       2>/dev/null
+        rm -f /usr/share/keyrings/nodesource*     2>/dev/null
         apt-get update -qq >> "$LOGFILE" 2>&1 || true
     fi
 fi
 
 if [[ "$NEED_NODE" == true ]]; then
-    # Altes NodeSource-Repo immer entfernen bevor neues eingerichtet wird
     rm -f /etc/apt/sources.list.d/nodesource* 2>/dev/null
-    rm -f /etc/apt/keyrings/nodesource* 2>/dev/null
+    rm -f /etc/apt/keyrings/nodesource*       2>/dev/null
 
     log_to_file "Node.js ${NODE_VERSION} via NodeSource..."
     curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" 2>/dev/null \
         | bash - >> "$LOGFILE" 2>&1
     run_cmd_or_die "Node.js" apt-get install -y -qq nodejs
 
-    # Verifiziere dass die richtige Version installiert wurde
     INSTALLED_NODE=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
     if [[ "$INSTALLED_NODE" -ne "$NODE_VERSION" ]] 2>/dev/null; then
         log_warn "Node.js v${INSTALLED_NODE} installiert statt v${NODE_VERSION}!"
@@ -792,7 +817,6 @@ log_ok "Node.js $(node --version 2>/dev/null), Yarn $(yarn --version 2>/dev/null
 
 step_start 7 "System-Python prüfen"
 
-# Finde das beste System-Python
 SYSTEM_PYTHON=""
 for py in python3.14 python3.13 python3.12 python3.11 python3; do
     if command -v "$py" &>/dev/null; then
@@ -816,7 +840,6 @@ if command -v wkhtmltopdf &>/dev/null; then
     stop_spinner
     log_ok "wkhtmltopdf bereits vorhanden."
 else
-    # Abhängigkeiten vorab installieren (fehlen auf Debian 13)
     for dep in xfonts-75dpi xfonts-base libxrender1 libxext6; do
         apt-get install -y -qq "$dep" >> "$LOGFILE" 2>&1 || true
     done
@@ -825,7 +848,6 @@ else
     WKHTML_DEB="/tmp/wkhtmltox.deb"
     WKHTML_OK=false
 
-    # URLs in Reihenfolge: neueste zuerst, Fallbacks danach
     WKHTML_URLS=(
         "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.${OS_ID}${OS_VERSION}_${ARCH}.deb"
         "https://github.com/wkhtmltopdf/packaging/releases/download/0.12.6.1-3/wkhtmltox_0.12.6.1-3.bookworm_${ARCH}.deb"
@@ -836,16 +858,12 @@ else
     for url in "${WKHTML_URLS[@]}"; do
         log_to_file "Versuche: ${url}"
         if wget -q -O "$WKHTML_DEB" "$url" 2>/dev/null; then
-            # dpkg installieren, fehlende Deps automatisch nachziehen
             dpkg -i "$WKHTML_DEB" >> "$LOGFILE" 2>&1 || true
             apt-get install -f -y -qq >> "$LOGFILE" 2>&1 || true
-
-            # Prüfe ob es WIRKLICH installiert ist
             if command -v wkhtmltopdf &>/dev/null; then
                 WKHTML_OK=true
                 break
             else
-                # Installation fehlgeschlagen — Paket entfernen und nächste URL
                 dpkg --remove wkhtmltox >> "$LOGFILE" 2>&1 || true
             fi
         fi
@@ -862,9 +880,6 @@ else
 fi
 
 # ─── 9. Benutzer & Bench ──────────────────────────────────────────────────────
-#
-# WICHTIG: uv, Python, bench CLI, bench init — alles als $BENCH_USER!
-# bench/uv erwarten alles im User-Home. Nichts darf unter /root/ landen.
 
 step_start 9 "Benutzer & Bench initialisieren"
 
@@ -874,7 +889,7 @@ if ! id "$BENCH_USER" &>/dev/null; then
     log_to_file "Benutzer ${BENCH_USER} erstellt."
 fi
 
-usermod -aG sudo "$BENCH_USER" >> "$LOGFILE" 2>&1 || true
+usermod -aG sudo "$BENCH_USER" >> "$LOGFILE" 2>/dev/null || true
 
 SUDOERS_FILE="/etc/sudoers.d/${BENCH_USER}"
 if [[ ! -f "$SUDOERS_FILE" ]]; then
@@ -884,9 +899,27 @@ fi
 
 USER_HOME="/home/${BENCH_USER}"
 
-# run_as_user: Führt Befehl komplett im User-Kontext aus.
-# Setzt HOME, USER, XDG-Pfade und CWD — damit Tools wie uv
-# nicht versehentlich /root/ referenzieren.
+# --- Passwörter in pwd.txt speichern (Quick-Install) ---
+if [[ "$QUICK_INSTALL" == true ]]; then
+    PWD_FILE="${USER_HOME}/pwd.txt"
+    cat > "$PWD_FILE" <<PWDEOF
+# Frappe Bench — Generierte Passwörter
+# Erstellt: $(date '+%Y-%m-%d %H:%M:%S')
+# !! WICHTIG: Diese Datei sicher aufbewahren und danach löschen !!
+
+MariaDB Root-Passwort : ${MYSQL_ROOT_PASS}
+Frappe Admin-Passwort : ${ADMIN_PASS}
+
+Site     : ${SITE_NAME}
+Bench    : ${BENCH_PATH}
+Login    : http://<IP>  →  Benutzer: Administrator  /  Passwort: (Admin oben)
+PWDEOF
+    chmod 600 "$PWD_FILE"
+    chown "${BENCH_USER}:${BENCH_USER}" "$PWD_FILE"
+    log_ok "Passwörter gespeichert: ${PWD_FILE}"
+fi
+
+# --- run_as_user ---
 run_as_user() {
     sudo -H -u "$BENCH_USER" \
         env -u UV_CONFIG_FILE \
@@ -923,8 +956,6 @@ fi
 # --- Python als User vorbereiten ---
 USER_PYTHON_BIN=""
 
-# Hilfsfunktion: Prüft ob Python-Version >= Minimum ist
-# Nutzung: python_version_ge "3.13" "3.10" → true
 python_version_ge() {
     local have="$1" need="$2"
     local have_major="${have%%.*}" have_minor="${have#*.}"
@@ -936,28 +967,30 @@ python_version_ge() {
 }
 
 if [[ -n "$PYTHON_EXACT" ]]; then
-    # v16: Braucht exakt Python 3.14.x — muss via uv installiert werden
     log_info "Installiere Python ${PYTHON_EXACT} als ${BENCH_USER} via uv..."
 
     if [[ "$USE_UV" == true ]]; then
         if [[ "$OUTPUT_MODE" == "verbose" ]]; then
-            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" 2>&1 | tee -a "$LOGFILE" >&3 || true
+            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" \
+                2>&1 | tee -a "$LOGFILE" >&3 || true
         else
-            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" >> "$LOGFILE" 2>&1 || true
+            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_EXACT}" \
+                >> "$LOGFILE" 2>&1 || true
         fi
 
-        USER_PYTHON_BIN=$(run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${PYTHON_EXACT}" 2>/dev/null || echo "")
+        USER_PYTHON_BIN=$(run_as_user \
+            "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${PYTHON_EXACT}" \
+            2>/dev/null || echo "")
 
         if [[ -n "$USER_PYTHON_BIN" ]]; then
             log_ok "Python ${PYTHON_EXACT} installiert: ${USER_PYTHON_BIN}"
         else
             log_warn "uv python install ${PYTHON_EXACT} fehlgeschlagen!"
-            log_to_file "DEBUG: uv python list:"
-            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python list --only-installed" >> "$LOGFILE" 2>&1 || true
+            run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python list --only-installed" \
+                >> "$LOGFILE" 2>&1 || true
         fi
     fi
 
-    # System-Python nur wenn es exakt 3.14.x ist
     if [[ -z "$USER_PYTHON_BIN" && -n "${SYSTEM_PYTHON:-}" ]]; then
         SYS_PY_VER=$("$SYSTEM_PYTHON" --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
         if [[ "$SYS_PY_VER" == "$PYTHON_EXACT" ]]; then
@@ -970,11 +1003,9 @@ if [[ -n "$PYTHON_EXACT" ]]; then
 
     [[ -z "$USER_PYTHON_BIN" ]] && die "Python ${PYTHON_EXACT} konnte nicht installiert werden!
     Frappe ${FRAPPE_BRANCH} erfordert zwingend Python ${PYTHON_EXACT}.
-    Prüfe ob 'uv python install ${PYTHON_EXACT}' als User funktioniert.
     Log: ${LOGFILE}"
 
 else
-    # v15: System-Python >= PYTHON_MIN reicht (3.10+)
     if [[ -n "${SYSTEM_PYTHON:-}" ]]; then
         SYS_PY_VER=$("$SYSTEM_PYTHON" --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
         if python_version_ge "$SYS_PY_VER" "$PYTHON_MIN"; then
@@ -985,19 +1016,17 @@ else
         fi
     fi
 
-    # Falls System-Python nicht reicht → via uv als User installieren
     if [[ -z "$USER_PYTHON_BIN" ]]; then
         log_info "Installiere Python ${PYTHON_MIN} als ${BENCH_USER} via uv..."
-        # uv für den User installieren falls noch nicht geschehen
         if ! run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv --version" >> "$LOGFILE" 2>&1; then
             run_as_user "curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh" >> "$LOGFILE" 2>&1 || true
         fi
-        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_MIN}" >> "$LOGFILE" 2>&1 || true
-        USER_PYTHON_BIN=$(run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${PYTHON_MIN}" 2>/dev/null || echo "")
-
-        if [[ -n "$USER_PYTHON_BIN" ]]; then
-            log_ok "Python ${PYTHON_MIN} via uv installiert: ${USER_PYTHON_BIN}"
-        fi
+        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${PYTHON_MIN}" \
+            >> "$LOGFILE" 2>&1 || true
+        USER_PYTHON_BIN=$(run_as_user \
+            "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${PYTHON_MIN}" \
+            2>/dev/null || echo "")
+        [[ -n "$USER_PYTHON_BIN" ]] && log_ok "Python ${PYTHON_MIN} via uv: ${USER_PYTHON_BIN}"
     fi
 
     [[ -z "$USER_PYTHON_BIN" ]] && die "Kein Python >= ${PYTHON_MIN} verfügbar!"
@@ -1008,13 +1037,17 @@ log_to_file "Python für bench: ${USER_PYTHON_BIN}"
 # --- frappe-bench CLI als User ---
 BENCH_CLI_OK=false
 if [[ "$USE_UV" == true ]]; then
-    if run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv tool install frappe-bench" >> "$LOGFILE" 2>&1; then
+    if run_as_user \
+        "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv tool install frappe-bench" \
+        >> "$LOGFILE" 2>&1; then
         BENCH_CLI_OK=true
     fi
 fi
 if [[ "$BENCH_CLI_OK" == false ]]; then
-    run_as_user "export PATH=\$HOME/.local/bin:\$PATH && pip3 install --user frappe-bench --break-system-packages" >> "$LOGFILE" 2>&1 || \
-    run_as_user "export PATH=\$HOME/.local/bin:\$PATH && pip3 install --user frappe-bench" >> "$LOGFILE" 2>&1 || \
+    run_as_user "export PATH=\$HOME/.local/bin:\$PATH && pip3 install --user frappe-bench --break-system-packages" \
+        >> "$LOGFILE" 2>&1 || \
+    run_as_user "export PATH=\$HOME/.local/bin:\$PATH && pip3 install --user frappe-bench" \
+        >> "$LOGFILE" 2>&1 || \
         die "frappe-bench CLI nicht installierbar!"
 fi
 
@@ -1038,16 +1071,13 @@ fi
 BENCH_BIN_DIR=$(dirname "$BENCH_BIN")
 log_to_file "bench Binary: ${BENCH_BIN}"
 
-# --- bench --version (aus /tmp — damit kein ./apps/ gelesen wird) ---
-BENCH_VERSION=$(run_as_user "cd /tmp && export PATH=${BENCH_BIN_DIR}:\$HOME/.local/bin:\$PATH && bench --version" 2>/dev/null || echo "")
-if [[ -z "$BENCH_VERSION" ]]; then
-    log_warn "bench --version schlägt fehl — fahre trotzdem fort."
-    BENCH_VERSION="unbekannt"
-fi
+BENCH_VERSION=$(run_as_user \
+    "cd /tmp && export PATH=${BENCH_BIN_DIR}:\$HOME/.local/bin:\$PATH && bench --version" \
+    2>/dev/null || echo "")
+[[ -z "$BENCH_VERSION" ]] && { log_warn "bench --version schlägt fehl — fahre fort."; BENCH_VERSION="unbekannt"; }
 log_to_file "bench CLI: v${BENCH_VERSION}"
 
-# ─── bench init ────────────────────────────────────────────────────────────────
-
+# --- bench init ---
 log_to_file "bench init ${BENCH_DIR} (${FRAPPE_BRANCH}), python=${USER_PYTHON_BIN}"
 
 BENCH_INIT_CMD="
@@ -1060,8 +1090,7 @@ BENCH_INIT_CMD="
 "
 
 if [[ "$OUTPUT_MODE" == "verbose" ]]; then
-    run_as_user "$BENCH_INIT_CMD" 2>&1 | tee -a "$LOGFILE" >&3 || \
-        die "bench init fehlgeschlagen!"
+    run_as_user "$BENCH_INIT_CMD" 2>&1 | tee -a "$LOGFILE" >&3 || die "bench init fehlgeschlagen!"
 else
     run_as_user "$BENCH_INIT_CMD" >> "$LOGFILE" 2>&1 || {
         stop_spinner
@@ -1072,26 +1101,26 @@ else
     }
 fi
 
-# ─── Validierung ───────────────────────────────────────────────────────────────
-
+# --- Validierung ---
 [[ ! -d "${BENCH_PATH}/apps/frappe" ]] && die "apps/frappe/ fehlt!"
 [[ ! -f "${BENCH_PATH}/env/bin/python" ]] && die "venv fehlt!"
 
-# DER kritische Check gegen "No module named 'frappe'"
 if ! run_as_user "cd ${BENCH_PATH} && env/bin/python -c 'import frappe'" >> "$LOGFILE" 2>&1; then
     log_warn "'import frappe' fehlgeschlagen — Reparatur..."
     run_as_user "cd ${BENCH_PATH} && env/bin/pip install -e apps/frappe" >> "$LOGFILE" 2>&1
     run_as_user "cd ${BENCH_PATH} && env/bin/python -c 'import frappe'" >> "$LOGFILE" 2>&1 || \
-        die "Reparatur gescheitert! 'import frappe' schlägt fehl."
+        die "Reparatur gescheitert! Log: ${LOGFILE}"
     log_to_file "Reparatur erfolgreich."
 fi
 
-FRAPPE_VERSION=$(run_as_user "cd ${BENCH_PATH} && env/bin/python -c 'import frappe; print(frappe.__version__)'" 2>/dev/null || echo "?")
+FRAPPE_VERSION=$(run_as_user \
+    "cd ${BENCH_PATH} && env/bin/python -c 'import frappe; print(frappe.__version__)'" \
+    2>/dev/null || echo "?")
 
 stop_spinner
 log_ok "Frappe ${FRAPPE_VERSION} — bench v${BENCH_VERSION}"
 
-# ─── Site (optional) ──────────────────────────────────────────────────────────
+# ─── Site ─────────────────────────────────────────────────────────────────────
 
 if [[ -n "$SITE_NAME" ]]; then
     log_info "Erstelle Site '${SITE_NAME}'..."
@@ -1134,7 +1163,6 @@ fi
 
 if [[ "$PROD_FAILED" == true ]]; then
     log_warn "bench setup production Probleme — Fallback..."
-
     run_as_user "
         export PATH=${BENCH_BIN_DIR}:\$HOME/.local/bin:/usr/local/bin:\$PATH
         cd ${BENCH_PATH}
@@ -1150,41 +1178,29 @@ if [[ "$PROD_FAILED" == true ]]; then
 fi
 
 svc_ctl enable supervisor supervisord || true
-supervisorctl reread        >> "$LOGFILE" 2>&1 || true
-supervisorctl update        >> "$LOGFILE" 2>&1 || true
+supervisorctl reread >> "$LOGFILE" 2>&1 || true
+supervisorctl update >> "$LOGFILE" 2>&1 || true
 
-# ─── Nginx-Config reparieren ──────────────────────────────────────────────────
-
-# Fix 1: bench generiert 'access_log ... main;' — aber Debian/Ubuntu Nginx
-#         definiert kein "main" Log-Format. Entferne das Format.
+# Nginx-Fix: 'main' Log-Format entfernen (nicht auf Debian/Ubuntu definiert)
 NGINX_BENCH_CONF="/etc/nginx/conf.d/${BENCH_DIR}.conf"
 if [[ -f "$NGINX_BENCH_CONF" ]]; then
     if grep -q 'access_log.*main' "$NGINX_BENCH_CONF" 2>/dev/null; then
         sed -i 's|access_log\(.*\) main;|access_log\1;|g' "$NGINX_BENCH_CONF"
-        log_to_file "Nginx-Fix: 'main' Log-Format aus Config entfernt."
+        log_to_file "Nginx-Fix: 'main' Log-Format entfernt."
     fi
 fi
 
-# Fix 2: Default-Site deaktivieren (falls noch nicht geschehen)
 rm -f /etc/nginx/sites-enabled/default 2>/dev/null
 
-# Nginx-Config testen bevor wir starten
 if nginx -t >> "$LOGFILE" 2>&1; then
     svc_ctl restart nginx nginx || true
-    log_to_file "Nginx neu gestartet."
 else
     log_warn "Nginx-Config fehlerhaft — prüfe: nginx -t"
-    log_to_file "Nginx-Config-Test fehlgeschlagen:"
     nginx -t >> "$LOGFILE" 2>&1 || true
 fi
 
-# ─── Dateiberechtigungen für Nginx (www-data) ─────────────────────────────────
-
-# Nginx läuft als www-data und muss statische Assets aus dem Bench-Verzeichnis
-# lesen können. Ohne diese Berechtigungen fehlen CSS/JS → Design-Bug.
 chmod 711 "${USER_HOME}"
 chmod -R 755 "${BENCH_PATH}/sites" 2>/dev/null || true
-log_to_file "Berechtigungen gesetzt: ${USER_HOME} (711), ${BENCH_PATH}/sites (755)"
 
 sleep 3
 stop_spinner
@@ -1200,26 +1216,20 @@ echo -e "\n${BOLD}Supervisor-Status:${NC}" >&3
 supervisorctl status 2>/dev/null | sed 's/^/    /' >&3 || \
     echo "    (noch nicht bereit — kurz warten)" >&3
 
-# ─── IP und Port ermitteln ─────────────────────────────────────────────────────
+# ─── URL ermitteln ─────────────────────────────────────────────────────────────
 
-# IP-Adresse der Instanz ermitteln (erste nicht-localhost IPv4)
 INSTANCE_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
-[[ -z "$INSTANCE_IP" ]] && INSTANCE_IP=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
+[[ -z "$INSTANCE_IP" ]] && \
+    INSTANCE_IP=$(ip -4 addr show scope global 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -1)
 [[ -z "$INSTANCE_IP" ]] && INSTANCE_IP="<IP>"
 
-# Nginx-Port (Standard: 80)
 NGINX_PORT="80"
 if [[ -f "${BENCH_PATH}/config/nginx.conf" ]]; then
     DETECTED_PORT=$(grep -oP 'listen\s+\K\d+' "${BENCH_PATH}/config/nginx.conf" 2>/dev/null | head -1)
     [[ -n "$DETECTED_PORT" ]] && NGINX_PORT="$DETECTED_PORT"
 fi
 
-# URL zusammenbauen
-if [[ "$NGINX_PORT" == "80" ]]; then
-    SITE_URL="http://${INSTANCE_IP}"
-else
-    SITE_URL="http://${INSTANCE_IP}:${NGINX_PORT}"
-fi
+[[ "$NGINX_PORT" == "80" ]] && SITE_URL="http://${INSTANCE_IP}" || SITE_URL="http://${INSTANCE_IP}:${NGINX_PORT}"
 
 # ─── Ergebnis ──────────────────────────────────────────────────────────────────
 
@@ -1232,7 +1242,7 @@ ${GREEN}╔═══════════════════════
     Frappe:     ${FRAPPE_VERSION} (${FRAPPE_BRANCH})
     MariaDB:    $(mariadb --version 2>/dev/null | grep -oP 'Ver \K[^ ]+' || echo '?')
     Node.js:    $(node --version 2>/dev/null || echo '?')
-    Python:     $(${USER_PYTHON_BIN} --version 2>/dev/null || run_as_user "${USER_PYTHON_BIN} --version" 2>/dev/null || echo '?')
+    Python:     $(${USER_PYTHON_BIN} --version 2>/dev/null || echo '?')
     Bench CLI:  v${BENCH_VERSION}
 
   ${BOLD}Pfade${NC}
@@ -1243,7 +1253,8 @@ if [[ -n "$SITE_NAME" ]]; then
     echo -e "
   ${BOLD}Site${NC}
     Name:       ${SITE_NAME}
-    ${GREEN}${BOLD}Website:    ${SITE_URL}${NC}" >&3
+    ${GREEN}${BOLD}Website:    ${SITE_URL}${NC}
+    Login:      Administrator / (siehe unten)" >&3
 else
     echo -e "
   ${BOLD}Website${NC}
@@ -1251,12 +1262,20 @@ else
     ${CYAN}cd ${BENCH_PATH} && bench new-site <name> --admin-password <pw> --mariadb-root-password <pw>${NC}" >&3
 fi
 
+if [[ "$QUICK_INSTALL" == true && -f "${PWD_FILE}" ]]; then
+    echo -e "
+  ${BOLD}${YELLOW}⚠  Passwörter (auch in ${PWD_FILE}):${NC}
+    MariaDB Root : ${MYSQL_ROOT_PASS}
+    Admin        : ${ADMIN_PASS}
+    ${DIM}→ Datei nach dem Speichern löschen: rm ${PWD_FILE}${NC}" >&3
+fi
+
 echo -e "
   ${BOLD}Befehle${NC}
-    ${CYAN}supervisorctl status${NC}                  Prozesse anzeigen
-    ${CYAN}supervisorctl restart all${NC}             Alles neustarten
-    ${CYAN}sudo -u ${BENCH_USER} bash${NC}                    Als Bench-User wechseln
-    ${CYAN}cd ${BENCH_PATH}${NC}       Bench-Verzeichnis
+    ${CYAN}supervisorctl status${NC}              Prozesse anzeigen
+    ${CYAN}supervisorctl restart all${NC}         Alles neustarten
+    ${CYAN}sudo -u ${BENCH_USER} bash${NC}                Als Bench-User wechseln
+    ${CYAN}cd ${BENCH_PATH}${NC}   Bench-Verzeichnis
 
   ${BOLD}Wichtig${NC}
     ${GREEN}✔${NC}  ${CYAN}supervisorctl${NC} verwenden — nicht ${RED}bench start${NC}!
