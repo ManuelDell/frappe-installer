@@ -254,7 +254,7 @@ install_pkg() {
 # ─── Passwort-Generator ───────────────────────────────────────────────────────
 
 generate_password() {
-    tr -dc 'A-Za-z0-9!@#%^&*' < /dev/urandom | head -c 20
+    (set +o pipefail; tr -dc 'A-Za-z0-9!@#%^&*' < /dev/urandom | head -c 20)
 }
 
 # ─── Voraussetzungen ──────────────────────────────────────────────────────────
