@@ -329,7 +329,7 @@ echo ""
 
 echo -e "${BOLD}Frappe-Version:${NC}"
 echo "  1) version-15  (stable — Python 3.11, Node 18, MariaDB 10.x)"
-echo "  2) version-16  (develop — Python 3.13+, Node 22, MariaDB 11.8)"
+echo "  2) version-16  (develop — Python 3.14, Node 24, MariaDB 11.8)"
 echo ""
 while true; do
     read -rp "Auswahl [1/2] (Standard: 1): " VERSION_CHOICE
@@ -427,24 +427,8 @@ if [[ "$FRAPPE_BRANCH" == "version-15" ]]; then
     USE_UV=false
     MARIADB_FROM_REPO=false
 else
-    # v16: Python-Version wählen
-    echo -e "${BOLD}Python-Version für Frappe v16:${NC}"
-    echo "  1) Python 3.13  (stabil, funktioniert mit v16 develop)"
-    echo "  2) Python 3.14  (wie in der offiziellen Doku — via uv/deadsnakes)"
-    echo ""
-    while true; do
-        read -rp "Auswahl [1/2] (Standard: 2): " PY_CHOICE
-        PY_CHOICE="${PY_CHOICE:-2}"
-        case "$PY_CHOICE" in
-            1) TARGET_PYTHON="3.13"; break ;;
-            2) TARGET_PYTHON="3.14"; break ;;
-            *) echo "  Bitte 1 oder 2." ;;
-        esac
-    done
-    log_ok "Python: ${TARGET_PYTHON}"
-    echo ""
-
-    NODE_VERSION="22"
+    TARGET_PYTHON="3.14"
+    NODE_VERSION="24"
     USE_UV=true
     MARIADB_FROM_REPO=true
 fi
@@ -460,6 +444,119 @@ export DEBCONF_NONINTERACTIVE_SEEN=true
 # MariaDB Feedback-Plugin vorab auf "No" setzen (verhindert ncurses-Dialog)
 if command -v debconf-set-selections &>/dev/null; then
     echo "mariadb-server mariadb-server/feedback_plugin_enable boolean false" | debconf-set-selections 2>/dev/null || true
+fi
+
+# ─── Vorherige Installation erkennen ──────────────────────────────────────────
+
+CLEANUP_NEEDED=false
+EXISTING_ITEMS=()
+
+# Bench-Verzeichnis existiert?
+if [[ -d "${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}" ]]; then
+    EXISTING_ITEMS+=("Bench-Verzeichnis: ${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}")
+    CLEANUP_NEEDED=true
+fi
+
+# User existiert mit altem bench/uv?
+if id "$BENCH_USER" &>/dev/null; then
+    USER_HOME_CHECK="/home/${BENCH_USER}"
+    [[ -d "${USER_HOME_CHECK}/.local/share/uv" ]] && EXISTING_ITEMS+=("uv-Daten: ${USER_HOME_CHECK}/.local/share/uv/")
+    [[ -f "${USER_HOME_CHECK}/.local/bin/bench" ]] && EXISTING_ITEMS+=("bench CLI: ${USER_HOME_CHECK}/.local/bin/bench")
+fi
+
+# Alte Node.js-Version?
+if command -v node &>/dev/null; then
+    EXISTING_NODE_MAJOR=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
+    if [[ "$EXISTING_NODE_MAJOR" -ne "$NODE_VERSION" ]] 2>/dev/null; then
+        EXISTING_ITEMS+=("Node.js v${EXISTING_NODE_MAJOR} (benötigt: v${NODE_VERSION})")
+    fi
+fi
+
+# Alte Supervisor-Configs?
+if ls /etc/supervisor/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1; then
+    EXISTING_ITEMS+=("Supervisor-Config für ${BENCH_DIR}")
+    CLEANUP_NEEDED=true
+fi
+
+# Alte Nginx-Configs?
+if ls /etc/nginx/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1; then
+    EXISTING_ITEMS+=("Nginx-Config für ${BENCH_DIR}")
+    CLEANUP_NEEDED=true
+fi
+
+if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
+    echo -e "\n${YELLOW}${BOLD}  ⚠  Vorherige Installation erkannt:${NC}"
+    for item in "${EXISTING_ITEMS[@]}"; do
+        echo -e "     • ${item}"
+    done
+    echo ""
+    echo -e "  ${BOLD}Optionen:${NC}"
+    echo "    1) Aufräumen — altes Bench-Verzeichnis, Configs und Caches löschen"
+    echo "    2) Überspringen — versuche trotzdem zu installieren (kann fehlschlagen)"
+    echo "    3) Abbrechen"
+    echo ""
+    while true; do
+        read -rp "$(echo -e "${BOLD}Auswahl [1/2/3]:${NC} ")" CLEANUP_CHOICE
+        case "$CLEANUP_CHOICE" in
+            1)
+                log_info "Räume auf..."
+
+                # Supervisor-Prozesse stoppen
+                if command -v supervisorctl &>/dev/null; then
+                    supervisorctl stop all >> "$LOGFILE" 2>&1 || true
+                fi
+
+                # Bench-Verzeichnis löschen
+                BENCH_FULL="${BENCH_PATH:-/home/${BENCH_USER}/${BENCH_DIR}}"
+                if [[ -d "$BENCH_FULL" ]]; then
+                    rm -rf "$BENCH_FULL"
+                    log_ok "Bench-Verzeichnis gelöscht: ${BENCH_FULL}"
+                fi
+
+                # Supervisor/Nginx-Configs entfernen
+                rm -f /etc/supervisor/conf.d/*"${BENCH_DIR}"* 2>/dev/null
+                rm -f /etc/nginx/conf.d/*"${BENCH_DIR}"* 2>/dev/null
+                supervisorctl reread >> "$LOGFILE" 2>&1 || true
+                supervisorctl update >> "$LOGFILE" 2>&1 || true
+
+                # uv/bench Caches und Tools im User-Home
+                if id "$BENCH_USER" &>/dev/null; then
+                    UH="/home/${BENCH_USER}"
+                    rm -rf "${UH}/.local/share/uv" 2>/dev/null
+                    rm -f "${UH}/.local/bin/bench" 2>/dev/null
+                    log_ok "User-Caches aufgeräumt."
+                fi
+
+                # Alte Node.js deinstallieren wenn falsche Version
+                if command -v node &>/dev/null; then
+                    OLD_NODE=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
+                    if [[ "$OLD_NODE" -ne "$NODE_VERSION" ]] 2>/dev/null; then
+                        log_info "Entferne Node.js v${OLD_NODE}..."
+                        apt-get remove -y -qq nodejs >> "$LOGFILE" 2>&1 || true
+                        apt-get autoremove -y -qq >> "$LOGFILE" 2>&1 || true
+                        # NodeSource-Repo entfernen
+                        rm -f /etc/apt/sources.list.d/nodesource.list 2>/dev/null
+                        log_ok "Node.js v${OLD_NODE} entfernt."
+                    fi
+                fi
+
+                log_ok "Aufräumen abgeschlossen."
+                break
+                ;;
+            2)
+                log_warn "Überspringe Aufräumen — Fehler möglich!"
+                break
+                ;;
+            3)
+                log_warn "Abgebrochen."
+                exit 0
+                ;;
+            *)
+                echo "  Bitte 1, 2 oder 3."
+                ;;
+        esac
+    done
+    echo ""
 fi
 
 # ─── 1. System aktualisieren ──────────────────────────────────────────────────
@@ -647,8 +744,14 @@ step_start 6 "Node.js ${NODE_VERSION} installieren"
 NEED_NODE=true
 if command -v node &>/dev/null; then
     EXISTING_MAJOR=$(node --version 2>/dev/null | sed 's/v//' | cut -d. -f1)
-    if [[ "$EXISTING_MAJOR" -ge "$NODE_VERSION" ]] 2>/dev/null; then
+    if [[ "$EXISTING_MAJOR" -eq "$NODE_VERSION" ]] 2>/dev/null; then
         NEED_NODE=false
+    elif [[ "$EXISTING_MAJOR" -ne "$NODE_VERSION" ]] 2>/dev/null; then
+        # Falsche Node-Version → deinstallieren
+        log_info "Node.js v${EXISTING_MAJOR} gefunden, benötigt v${NODE_VERSION} — ersetze..."
+        apt-get remove -y -qq nodejs >> "$LOGFILE" 2>&1 || true
+        rm -f /etc/apt/sources.list.d/nodesource.list 2>/dev/null
+        apt-get update -qq >> "$LOGFILE" 2>&1 || true
     fi
 fi
 
@@ -748,7 +851,19 @@ fi
 
 USER_HOME="/home/${BENCH_USER}"
 
-run_as_user() { sudo -H -u "$BENCH_USER" bash -l -c "$*"; }
+# run_as_user: Führt Befehl komplett im User-Kontext aus.
+# Setzt HOME, USER, XDG-Pfade und CWD — damit Tools wie uv
+# nicht versehentlich /root/ referenzieren.
+run_as_user() {
+    sudo -H -u "$BENCH_USER" \
+        env -u UV_CONFIG_FILE \
+        HOME="${USER_HOME}" \
+        USER="${BENCH_USER}" \
+        XDG_CONFIG_HOME="${USER_HOME}/.config" \
+        XDG_DATA_HOME="${USER_HOME}/.local/share" \
+        XDG_CACHE_HOME="${USER_HOME}/.cache" \
+        bash -l -c "cd \$HOME && $*"
+}
 
 # --- PATH in .profile und .bashrc ---
 BENCH_ENV_PATHS='export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:$PATH"'
@@ -776,20 +891,44 @@ fi
 USER_PYTHON_BIN=""
 
 if [[ "$USE_UV" == true ]]; then
-    log_to_file "Installiere Python ${TARGET_PYTHON} als ${BENCH_USER} via uv..."
+    log_info "Installiere Python ${TARGET_PYTHON} als ${BENCH_USER} via uv..."
 
-    if run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${TARGET_PYTHON}" >> "$LOGFILE" 2>&1; then
-        USER_PYTHON_BIN=$(run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${TARGET_PYTHON}" 2>/dev/null || echo "")
-        [[ -n "$USER_PYTHON_BIN" ]] && log_to_file "Python als User: ${USER_PYTHON_BIN}"
+    if [[ "$OUTPUT_MODE" == "verbose" ]]; then
+        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${TARGET_PYTHON}" 2>&1 | tee -a "$LOGFILE" >&3 || true
+    else
+        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python install ${TARGET_PYTHON}" >> "$LOGFILE" 2>&1 || true
+    fi
+
+    # Prüfe ob es geklappt hat
+    USER_PYTHON_BIN=$(run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python find ${TARGET_PYTHON}" 2>/dev/null || echo "")
+
+    if [[ -n "$USER_PYTHON_BIN" ]]; then
+        log_ok "Python ${TARGET_PYTHON} installiert: ${USER_PYTHON_BIN}"
+    else
+        log_warn "uv python install ${TARGET_PYTHON} fehlgeschlagen!"
+        # Zeige was uv tatsächlich installiert hat
+        log_to_file "DEBUG: uv python list:"
+        run_as_user "export PATH=\$HOME/.local/bin:\$HOME/.cargo/bin:\$PATH && uv python list --only-installed" >> "$LOGFILE" 2>&1 || true
     fi
 fi
 
-# Fallback: System-Python
+# Fallback: System-Python — aber NUR wenn die Version passt!
 if [[ -z "$USER_PYTHON_BIN" && -n "${SYSTEM_PYTHON:-}" ]]; then
-    USER_PYTHON_BIN="$SYSTEM_PYTHON"
-    log_to_file "Fallback System-Python: ${USER_PYTHON_BIN}"
+    SYS_PY_VERSION=$("$SYSTEM_PYTHON" --version 2>&1 | grep -oP '\d+\.\d+' | head -1)
+    if [[ "$SYS_PY_VERSION" == "$TARGET_PYTHON" ]]; then
+        USER_PYTHON_BIN="$SYSTEM_PYTHON"
+        log_ok "System-Python ${SYS_PY_VERSION} passt."
+    else
+        log_warn "System-Python ist ${SYS_PY_VERSION}, aber ${TARGET_PYTHON} wird benötigt!"
+    fi
 fi
-[[ -z "$USER_PYTHON_BIN" ]] && die "Kein Python verfügbar!"
+
+if [[ -z "$USER_PYTHON_BIN" ]]; then
+    die "Python ${TARGET_PYTHON} konnte nicht installiert werden!
+    Frappe ${FRAPPE_BRANCH} erfordert zwingend Python ${TARGET_PYTHON}.
+    Prüfe ob 'uv python install ${TARGET_PYTHON}' als User funktioniert.
+    Log: ${LOGFILE}"
+fi
 
 # --- frappe-bench CLI als User ---
 BENCH_CLI_OK=false
