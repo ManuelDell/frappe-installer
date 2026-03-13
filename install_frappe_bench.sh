@@ -1152,7 +1152,39 @@ fi
 svc_ctl enable supervisor supervisord || true
 supervisorctl reread        >> "$LOGFILE" 2>&1 || true
 supervisorctl update        >> "$LOGFILE" 2>&1 || true
-svc_ctl restart nginx nginx || true
+
+# ─── Nginx-Config reparieren ──────────────────────────────────────────────────
+
+# Fix 1: bench generiert 'access_log ... main;' — aber Debian/Ubuntu Nginx
+#         definiert kein "main" Log-Format. Entferne das Format.
+NGINX_BENCH_CONF="/etc/nginx/conf.d/${BENCH_DIR}.conf"
+if [[ -f "$NGINX_BENCH_CONF" ]]; then
+    if grep -q 'access_log.*main' "$NGINX_BENCH_CONF" 2>/dev/null; then
+        sed -i 's|access_log\(.*\) main;|access_log\1;|g' "$NGINX_BENCH_CONF"
+        log_to_file "Nginx-Fix: 'main' Log-Format aus Config entfernt."
+    fi
+fi
+
+# Fix 2: Default-Site deaktivieren (falls noch nicht geschehen)
+rm -f /etc/nginx/sites-enabled/default 2>/dev/null
+
+# Nginx-Config testen bevor wir starten
+if nginx -t >> "$LOGFILE" 2>&1; then
+    svc_ctl restart nginx nginx || true
+    log_to_file "Nginx neu gestartet."
+else
+    log_warn "Nginx-Config fehlerhaft — prüfe: nginx -t"
+    log_to_file "Nginx-Config-Test fehlgeschlagen:"
+    nginx -t >> "$LOGFILE" 2>&1 || true
+fi
+
+# ─── Dateiberechtigungen für Nginx (www-data) ─────────────────────────────────
+
+# Nginx läuft als www-data und muss statische Assets aus dem Bench-Verzeichnis
+# lesen können. Ohne diese Berechtigungen fehlen CSS/JS → Design-Bug.
+chmod 711 "${USER_HOME}"
+chmod -R 755 "${BENCH_PATH}/sites" 2>/dev/null || true
+log_to_file "Berechtigungen gesetzt: ${USER_HOME} (711), ${BENCH_PATH}/sites (755)"
 
 sleep 3
 stop_spinner
