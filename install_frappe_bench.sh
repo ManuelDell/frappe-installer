@@ -515,14 +515,6 @@ ls /etc/supervisor/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1 && \
 ls /etc/nginx/conf.d/*"${BENCH_DIR}"* &>/dev/null 2>&1 && \
     EXISTING_ITEMS+=("Nginx-Config für ${BENCH_DIR}")
 
-# MariaDB-DBs werden nach Schritt 4 bereinigt (erst dann ist Root-Passwort sicher gesetzt)
-DB_CLIENT=""
-if command -v mariadb &>/dev/null; then
-    DB_CLIENT="mariadb"
-elif command -v mysql &>/dev/null; then
-    DB_CLIENT="mysql"
-fi
-
 if [[ ${#EXISTING_ITEMS[@]} -gt 0 ]]; then
     echo -e "\n${YELLOW}${BOLD}  ⚠  Vorherige Installation erkannt:${NC}"
     for item in "${EXISTING_ITEMS[@]}"; do
@@ -648,6 +640,20 @@ fi
 
 step_start 3 "MariaDB installieren"
 
+# MariaDB wird bei jedem Durchlauf komplett neu installiert:
+# purge + /var/lib/mysql löschen = garantiert leerer Zustand, kein Passwort, keine DBs.
+if dpkg -l mariadb-server 2>/dev/null | grep -q "^ii"; then
+    log_to_file "Bestehende MariaDB wird entfernt (purge)..."
+    svc_ctl stop mariadb mariadbd || true
+    pkill -x mariadbd 2>/dev/null || true
+    sleep 2
+    run_cmd "MariaDB purge" apt-get purge -y -qq mariadb-server mariadb-client mariadb-common
+    run_cmd "apt autoremove" apt-get autoremove -y -qq
+    rm -rf /var/lib/mysql       2>/dev/null || true
+    rm -rf /etc/mysql/mariadb.conf.d/99-frappe.cnf 2>/dev/null || true
+    log_ok "MariaDB vollständig entfernt (inkl. Datendateien)."
+fi
+
 if [[ "$MARIADB_FROM_REPO" == true ]]; then
     log_to_file "MariaDB 11.8 aus offiziellem Repo..."
     curl -fsSL "https://mariadb.org/mariadb_release_signing_key.pgp" \
@@ -657,18 +663,15 @@ if [[ "$MARIADB_FROM_REPO" == true ]]; then
 deb [signed-by=/usr/share/keyrings/mariadb-keyring.gpg] https://dlm.mariadb.com/repo/mariadb-server/11.8/repo/${OS_ID} ${OS_CODENAME} main
 EOF
     run_cmd "MariaDB Repo Update" apt-get update -qq
-    run_cmd_or_die "MariaDB installieren" apt-get install -y -qq mariadb-server mariadb-client
-else
-    if ! dpkg -l mariadb-server 2>/dev/null | grep -q "^ii"; then
-        run_cmd_or_die "MariaDB installieren" apt-get install -y -qq mariadb-server mariadb-client
-    fi
 fi
+
+run_cmd_or_die "MariaDB installieren" apt-get install -y -qq mariadb-server mariadb-client
 
 svc_ctl enable mariadb mariadbd || true
 svc_ctl start mariadb mariadbd || die "MariaDB konnte nicht gestartet werden!"
 
 stop_spinner
-log_ok "MariaDB läuft."
+log_ok "MariaDB frisch installiert und gestartet."
 
 # ─── 4. MariaDB konfigurieren ─────────────────────────────────────────────────
 
@@ -721,28 +724,6 @@ elif mariadb -u root -p"${MYSQL_ROOT_PASS}" -e "SELECT 1;" >> "$LOGFILE" 2>&1; t
 else
     stop_spinner
     log_warn "MariaDB Root hat ein anderes Passwort — bitte prüfen!"
-fi
-
-# --- MariaDB: Alle Nicht-System-DBs löschen (jetzt mit gesetztem Root-Passwort) ---
-# Wird hier ausgeführt damit bench new-site keine Konflikte mit alten Instanzen hat.
-DB_CLIENT_CMD="mariadb -u root -p${MYSQL_ROOT_PASS} --connect-timeout=5"
-MARIADB_EXTRA_DBS=()
-while IFS= read -r db; do
-    [[ -z "$db" || "$db" == "Database" ]] && continue
-    MARIADB_EXTRA_DBS+=("$db")
-done < <($DB_CLIENT_CMD -e "SHOW DATABASES;" 2>/dev/null \
-    | grep -v -E "^(Database|mysql|information_schema|performance_schema|sys)$" || true)
-
-if [[ ${#MARIADB_EXTRA_DBS[@]} -gt 0 ]]; then
-    log_info "Lösche alte MariaDB-Datenbanken: ${MARIADB_EXTRA_DBS[*]}"
-    for db in "${MARIADB_EXTRA_DBS[@]}"; do
-        $DB_CLIENT_CMD -e "DROP DATABASE IF EXISTS \`${db}\`;" >> "$LOGFILE" 2>&1 && \
-            log_ok "DB gelöscht: ${db}" || log_warn "DB löschen fehlgeschlagen: ${db}"
-        $DB_CLIENT_CMD -e "DROP USER IF EXISTS '${db}'@'localhost';" >> "$LOGFILE" 2>&1 || true
-        $DB_CLIENT_CMD -e "DROP USER IF EXISTS '${db}'@'%';"         >> "$LOGFILE" 2>&1 || true
-    done
-    $DB_CLIENT_CMD -e "FLUSH PRIVILEGES;" >> "$LOGFILE" 2>&1 || true
-    log_ok "MariaDB-Cleanup abgeschlossen (${#MARIADB_EXTRA_DBS[@]} DBs entfernt)."
 fi
 
 # ─── 5. Redis ─────────────────────────────────────────────────────────────────
