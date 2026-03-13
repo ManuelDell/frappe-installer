@@ -667,6 +667,10 @@ fi
 
 run_cmd_or_die "MariaDB installieren" apt-get install -y -qq mariadb-server mariadb-client
 
+# libmariadb-dev wird von apt autoremove ggf. mitentfernt — explizit sicherstellen
+run_cmd_or_die "libmariadb-dev nachinstallieren" apt-get install -y -qq \
+    libmariadb-dev pkg-config default-libmysqlclient-dev
+
 svc_ctl enable mariadb mariadbd || true
 svc_ctl start mariadb mariadbd || die "MariaDB konnte nicht gestartet werden!"
 
