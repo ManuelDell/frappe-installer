@@ -1,8 +1,10 @@
-# Frappe Bench Installer
+# frappe-installer
 
-Ein interaktives Installationsskript für [Frappe Framework](https://frappe.io/framework) auf Debian und Ubuntu — speziell gehärtet für **LXC-Container** (z. B. Proxmox).
+Ein robustes Bash-Skript zur vollautomatischen Installation von [Frappe Bench](https://frappeframework.com) auf Debian/Ubuntu — inklusive Production-Setup mit Nginx und Supervisor.
 
-Das Skript installiert alle Abhängigkeiten, richtet MariaDB ein, erstellt einen dedizierten Linux-Benutzer, initialisiert eine Bench und konfiguriert ein Production-Setup mit **Supervisor + Nginx** — alles in einem Durchlauf.
+Entwickelt und gepflegt von **[Dells Dienste](https://diedells.de)**.
+
+---
 
 ## Schnellstart
 
@@ -12,204 +14,159 @@ chmod +x install_frappe_bench.sh
 sudo bash install_frappe_bench.sh
 ```
 
-Das Skript fragt alles Nötige interaktiv ab. Keine Argumente nötig.
-
-## Was wird abgefragt?
-
-| Abfrage | Standard | Beispiel |
-|---|---|---|
-| Ausgabe-Modus | Fortschrittsbalken | Verbose |
-| Frappe-Version | version-15 (stable) | version-16 (develop) |
-| Linux-Benutzername | `frappe` | `erpnext` |
-| Bench-Ordnername | `frappe-bench` | `mein-bench` |
-| MariaDB Root-Passwort | — | *(wird abgefragt + bestätigt)* |
-| Site erstellen? | Nein | `erp.example.com` |
-| Admin-Passwort | — | *(wird abgefragt + bestätigt)* |
-
-## Was wird installiert?
-
-### version-15 (stable)
-
-| Komponente | Version |
-|---|---|
-| Python | 3.11 (System) |
-| Node.js | 18 (NodeSource) |
-| MariaDB | 10.x (Debian/Ubuntu Repo) |
-| Redis | System-Paket |
-
-### version-16 (develop)
-
-| Komponente | Version |
-|---|---|
-| Python | 3.14 (via uv, als User — **zwingend erforderlich**) |
-| Node.js | 24 (NodeSource — **zwingend erforderlich**) |
-| MariaDB | 11.8 (offizielles MariaDB Repo) |
-| Redis | System-Paket |
-| uv | aktuell (als User installiert) |
-
-## Installationsschritte
-
-```
- 1/10  System aktualisieren
- 2/10  Abhängigkeiten installieren
- 3/10  MariaDB installieren
- 4/10  MariaDB konfigurieren (Charset, Root-PW, Absicherung)
- 5/10  Redis konfigurieren
- 6/10  Node.js + Yarn installieren
- 7/10  System-Python prüfen
- 8/10  wkhtmltopdf installieren
- 9/10  Benutzer erstellen, uv/Python/Bench CLI + bench init
-10/10  Production-Setup (Supervisor + Nginx)
-```
+---
 
 ## Features
 
-### LXC-kompatibel
+- 🌐 **Zweisprachig** — Deutsch (Standard) und Englisch wählbar
+- ⚡ **Quick-Install-Modus** — vollautomatisch ohne Eingaben, Passwörter werden generiert und gespeichert
+- 🎛️ **Interaktiver Modus** — individuelle Konfiguration von Version, Benutzer, Pfad, Passwörtern
+- 📊 **Fortschrittsbalken oder Verbose-Ausgabe** wählbar
+- 📋 **Vollständiges Logfile** unter `/var/log/install_frappe_bench_*.log`
+- 🔄 **Idempotent** — erkennt vorherige Installationen und räumt sauber auf
+- 🗄️ **MariaDB-Reset** — bei Neuinstallation wird MariaDB immer per `purge` entfernt und neu installiert, damit keine alten Datenbanken oder Passwörter stören
+- 🐳 **LXC-kompatibel** — funktioniert in Proxmox LXC-Containern (D-Bus-Fallbacks für `systemctl`)
+- 🔧 **Auto-Repair** — repariert automatisch fehlerhafte `bench init`-Zustände
 
-- **D-Bus-Fehler abgefangen**: `systemctl` schlägt in LXC-Containern oft mit D-Bus-Fehlern fehl, obwohl der Dienst läuft. Das Skript prüft per `pgrep` ob der Prozess tatsächlich aktiv ist und fällt bei Bedarf auf `service` oder direkten Prozessstart zurück.
-- **Fehlende Pakete**: Auf minimalen Debian-Installationen (LXC-Templates) fehlen Pakete wie `software-properties-common`. Diese werden als optional behandelt — das Skript installiert jedes Paket einzeln und loggt nicht verfügbare als Warnung.
-- **Keine interaktiven dpkg-Dialoge**: `DEBIAN_FRONTEND=noninteractive` verhindert Prompts wie den MariaDB Feedback-Plugin-Dialog.
+---
 
-### Saubere User-Isolation
+## Unterstützte Systeme
 
-Alles was bench betrifft läuft als dedizierter User:
+| OS | Version |
+|---|---|
+| Debian | 12 (Bookworm), 13 (Trixie) |
+| Ubuntu | 22.04 LTS, 24.04 LTS |
 
-- `uv` wird als Bench-User installiert (nicht als root)
-- Python wird im User-Home installiert (`~/.local/share/uv/python/`)
-- `bench` CLI wird per `uv tool install` im User-Kontext eingerichtet
-- Keine Dateien unter `/root/` die der Bench-User nicht erreichen kann
+> Muss als **root** ausgeführt werden.
 
-### Ausgabe-Modi
+---
 
-**Fortschrittsbalken** — saubere Anzeige mit Spinner, alle Details im Logfile:
+## Unterstützte Frappe-Versionen
+
+| Branch | Python | Node.js | MariaDB |
+|---|---|---|---|
+| `version-15` (stable) | 3.10+ | 20 LTS | 10.x (System) |
+| `version-16` (develop) | 3.14 (exakt) | 24 | 11.8 (offizielles Repo) |
+
+---
+
+## Installations-Modi
+
+### 1. Quick-Install
+
+Vollautomatisch ohne weitere Eingaben. Startet nach einem 3-Sekunden-Countdown (Abbruch: `Ctrl+C`).
+
+**Feste Vorkonfiguration:**
+- Branch: `version-16`
+- Linux-Benutzer: `frappe`
+- Bench-Pfad: `/home/frappe/frappe-bench`
+- Site: `frappe.localhost`
+- Passwörter: automatisch generiert, gespeichert in `/home/frappe/pwd.txt`
+
+### 2. Interaktiv
+
+Alle Parameter werden abgefragt:
+- Ausgabe-Modus (Fortschrittsbalken / Verbose)
+- Frappe-Version (v15 / v16)
+- Linux-Benutzername
+- Bench-Ordnername
+- MariaDB Root-Passwort
+- Optional: Site-Name und Admin-Passwort
+
+---
+
+## Was installiert wird
+
+Das Skript führt **10 Schritte** aus:
+
+1. System aktualisieren (`apt update && apt upgrade`)
+2. Abhängigkeiten installieren (Build-Tools, Python-Dev, Redis, Nginx, Supervisor, ...)
+3. MariaDB installieren (purge & Neuinstallation, für v16: MariaDB 11.8 aus offiziellem Repo)
+4. MariaDB konfigurieren (UTF-8, InnoDB-Tuning, Root-Passwort setzen)
+5. Redis konfigurieren
+6. Node.js installieren (via NodeSource, v20 oder v24)
+7. Python prüfen (System-Python oder via `uv` installiert)
+8. wkhtmltopdf installieren (für PDF-Generierung)
+9. Benutzer anlegen, `uv` installieren, `bench init` ausführen, optional Site erstellen
+10. Production-Setup (`bench setup production`, Nginx + Supervisor aktivieren)
+
+---
+
+## Passwörter (Quick-Install)
+
+Die generierten Passwörter werden in `/home/frappe/pwd.txt` gespeichert (Berechtigungen: `600`).  
+Am Ende der Installation werden sie zusätzlich direkt im Terminal angezeigt.
 
 ```
-  [████████████████░░░░░░░░░░░░░░] 53%  Benutzer & Bench initialisieren
-    ⠹ Benutzer & Bench initialisieren
+# Frappe Bench — Generierte Passwörter
+MariaDB Root-Passwort : <generiert>
+Frappe Admin-Passwort : <generiert>
+
+Site     : frappe.localhost
+Login    : http://<IP>  →  Administrator / <admin-passwort>
 ```
 
-**Verbose** — alle Ausgaben live auf dem Terminal + Logfile.
+> ⚠️ Datei nach dem Sichern löschen: `rm /home/frappe/pwd.txt`
 
-In beiden Modi wird ein vollständiges Logfile geschrieben:
-
-```
-/var/log/install_frappe_bench_YYYYMMDD_HHMMSS.log
-```
-
-### Automatische Validierung
-
-Nach `bench init` prüft das Skript:
-
-1. Existiert `apps/frappe/`?
-2. Existiert `env/bin/python` (venv)?
-3. Kann `import frappe` im venv ausgeführt werden?
-
-Falls der Import fehlschlägt, wird automatisch `pip install -e apps/frappe` als Reparatur versucht — das verhindert den berüchtigten `No module named 'frappe'`-Fehler bei `bench start`.
+---
 
 ## Nach der Installation
 
-### Dienste verwalten
-
 ```bash
-# Prozesse anzeigen
+# Prozess-Status anzeigen
 supervisorctl status
 
 # Alles neustarten
 supervisorctl restart all
 
-# Einzelnen Prozess neustarten
-supervisorctl restart frappe-bench-web:frappe-bench-frappe-web
-```
-
-> **Wichtig**: Verwende `supervisorctl` — nicht `bench start`! `bench start` ist nur für die Entwicklung gedacht.
-
-### Als Bench-User arbeiten
-
-```bash
+# Als Bench-Benutzer wechseln
 sudo -u frappe bash
-cd ~/frappe-bench
+
+# ERPNext installieren
+cd /home/frappe/frappe-bench
+bench get-app erpnext --branch version-16
+bench --site frappe.localhost install-app erpnext
+
+# HTTPS einrichten
+bench setup lets-encrypt frappe.localhost
+
+# Logs verfolgen
+tail -f /home/frappe/frappe-bench/logs/*.log
 ```
 
-### ERPNext hinzufügen
+> ⚠️ **Immer `supervisorctl` verwenden** — nicht `bench start`. Der Production-Modus läuft über Supervisor.
 
-```bash
-bench get-app erpnext --branch version-15   # oder version-16
-bench --site <site-name> install-app erpnext
+---
+
+## Logfile
+
+Jeder Durchlauf erzeugt ein vollständiges Logfile:
+
+```
+/var/log/install_frappe_bench_YYYYMMDD_HHMMSS.log
 ```
 
-### HTTPS einrichten
+Bei Fehlern werden die letzten 30 Zeilen direkt im Terminal angezeigt.
 
-```bash
-bench setup lets-encrypt <site-name>
-```
+---
 
-### Site erstellen (falls bei Installation übersprungen)
+## Bekannte Eigenheiten
 
-```bash
-bench new-site erp.example.com \
-    --mariadb-root-password <pw> \
-    --admin-password <pw>
-bench use erp.example.com
-sudo bench setup production frappe --yes
-```
+**LXC-Container (Proxmox):**  
+`systemctl` schlägt in unprivilegierten Containern wegen fehlendem D-Bus manchmal fehl. Das Skript fängt das ab und prüft den Prozess-Status direkt via `pgrep`.
 
-### Logs
+**MariaDB wird immer neu installiert:**  
+Bei jedem Skript-Durchlauf wird MariaDB per `apt purge` entfernt und neu installiert. Das garantiert einen sauberen Zustand ohne alte Passwörter oder verwaiste Datenbanken. Bestehende Frappe-Daten werden dabei gelöscht.
 
-```bash
-tail -f ~/frappe-bench/logs/*.log
-```
+**Python 3.14 für v16:**  
+Frappe v16 benötigt exakt Python 3.14. Das Skript installiert es automatisch über [`uv`](https://github.com/astral-sh/uv) im User-Kontext des Bench-Benutzers.
 
-## Voraussetzungen
-
-- **OS**: Debian 12+ oder Ubuntu 22.04+ (inkl. LXC)
-- **Ausführung**: Als `root` oder mit `sudo`
-- **Netzwerk**: Internetzugang (für apt, npm, pip, git clone)
-- **RAM**: Mindestens 2 GB empfohlen
-- **Disk**: Mindestens 10 GB frei
-
-## Fehlerbehebung
-
-### Logfile prüfen
-
-```bash
-cat /var/log/install_frappe_bench_*.log
-```
-
-### MariaDB antwortet nicht
-
-```bash
-# Prozess prüfen
-pgrep mariadbd
-
-# Manuell starten
-systemctl start mariadb
-# oder in LXC:
-service mariadb start
-```
-
-### bench --version schlägt fehl
-
-`bench` versucht immer das aktuelle Verzeichnis als Bench-Directory zu lesen. Aus `/root/` oder einem Verzeichnis ohne Zugriff kommt ein `PermissionError`. Lösung:
-
-```bash
-cd /tmp && bench --version
-# oder besser:
-sudo -u frappe bash -c "cd /tmp && bench --version"
-```
-
-### "No module named 'frappe'"
-
-Falls das trotz Validierung auftritt:
-
-```bash
-cd ~/frappe-bench
-./env/bin/pip install -e apps/frappe
-```
+---
 
 ## Lizenz
 
-MIT
+MIT — siehe [LICENSE](LICENSE)
 
-## Autor
+---
 
-**Dells Dienste** — [diedells.de](https://diedells.de)
+*Dells Dienste · [diedells.de](https://diedells.de)*
