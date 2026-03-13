@@ -41,8 +41,8 @@ Das Skript fragt alles Nötige interaktiv ab. Keine Argumente nötig.
 
 | Komponente | Version |
 |---|---|
-| Python | 3.13 (via uv, als User) |
-| Node.js | 22 (NodeSource) |
+| Python | 3.14 (via uv, als User — **zwingend erforderlich**) |
+| Node.js | 24 (NodeSource — **zwingend erforderlich**) |
 | MariaDB | 11.8 (offizielles MariaDB Repo) |
 | Redis | System-Paket |
 | uv | aktuell (als User installiert) |
